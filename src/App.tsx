@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import * as XLSX from 'xlsx'
+import sqlWasmUrl from 'sql.js/dist/sql-wasm.wasm?url'
 import {
   closestCenter,
   DndContext,
@@ -38,6 +39,8 @@ import {
   YAxis,
   type SunburstData,
 } from 'recharts'
+import initSqlJs from 'sql.js'
+import type { Database, QueryExecResult, SqlJsStatic } from 'sql.js'
 
 type ChartType = 'bar' | 'line' | 'area' | 'scatter' | 'pie' | 'sunburst'
 type DataRow = Record<string, unknown>
@@ -66,8 +69,149 @@ type PivotAccumulator = {
   distinctValues: Set<string>
 }
 
+type ViewConfig = {
+  chartType: ChartType
+  dataSourceMode: DataSourceMode
+  pivotRowColumn: string
+  pivotSeriesColumn: string
+  pivotValueColumn: string
+  pivotAggregation: PivotAggregation
+  pivotSortOrder: PivotSortOrder
+  pivotTopN: number
+  filterColumn: string
+  filterQuery: string
+  querySql: string
+  wizardGoal: WizardGoal
+  wizardMetric: string
+  wizardDimension: string
+  wizardSeries: string
+  selectedColumns: string[]
+}
+
+type SavedView = {
+  id: string
+  name: string
+  config: ViewConfig
+}
+
+type DataSourceMode = 'pivot' | 'query' | 'wizard'
+
+type WizardGoal = 'compare' | 'trend' | 'composition' | 'relationship' | 'hierarchy'
+
+type ColumnInsights = {
+  numeric: string[]
+  temporal: string[]
+  categorical: string[]
+}
+
+type WizardTemplate = {
+  id: string
+  label: string
+  goal: WizardGoal
+  chartType: ChartType
+  description: string
+}
+
+type ChartModel = {
+  chartData: Record<string, string | number>[]
+  pieData: Array<{ name: string; value: number }>
+  seriesKeys: string[]
+  filteredRowCount: number
+}
+
+type AppLogEntry = {
+  id: string
+  level: 'info' | 'error'
+  message: string
+  timestamp: string
+}
+
 const MAX_ROWS = 25000
 const COLORS = ['#126782', '#f29559', '#457b9d', '#2a9d8f', '#b56576', '#ff7f51']
+const SETTINGS_STORAGE_KEY = 'data-visualizer-settings-v1'
+const SAVED_VIEWS_STORAGE_KEY = 'data-visualizer-saved-views-v1'
+const SQLITE_DB_STORAGE_KEY = 'data-visualizer-sqlite-db-v1'
+const SQL_TABLE_SOURCE = 'uploaded_data'
+
+const WIZARD_TEMPLATES: WizardTemplate[] = [
+  {
+    id: 'tmpl-top-categories',
+    label: 'Top Categories',
+    goal: 'compare',
+    chartType: 'bar',
+    description: 'Compare totals across categories.',
+  },
+  {
+    id: 'tmpl-monthly-trend',
+    label: 'Monthly Trend',
+    goal: 'trend',
+    chartType: 'line',
+    description: 'Show metric movement over time.',
+  },
+  {
+    id: 'tmpl-share-breakdown',
+    label: 'Share Breakdown',
+    goal: 'composition',
+    chartType: 'pie',
+    description: 'Understand contribution by segment.',
+  },
+  {
+    id: 'tmpl-hierarchy-view',
+    label: 'Hierarchy View',
+    goal: 'hierarchy',
+    chartType: 'sunburst',
+    description: 'Drill through multi-level structure.',
+  },
+]
+
+function quoteSqlIdentifier(identifier: string): string {
+  return `"${identifier.replaceAll('"', '""')}"`
+}
+
+function looksLikeDate(value: unknown): boolean {
+  if (typeof value !== 'string') {
+    return false
+  }
+
+  const text = value.trim()
+  if (!text) {
+    return false
+  }
+
+  const isoLike = /^\d{4}[-/]\d{1,2}[-/]\d{1,2}/.test(text)
+  if (!isoLike) {
+    return false
+  }
+
+  return !Number.isNaN(Date.parse(text))
+}
+
+function getColumnInsights(headers: string[], dataRows: DataRow[]): ColumnInsights {
+  const numeric: string[] = []
+  const temporal: string[] = []
+  const categorical: string[] = []
+
+  headers.forEach((header) => {
+    const sample = dataRows.slice(0, 250).map((row) => row[header]).filter((value) => value != null)
+
+    const numericHits = sample.filter((value) => toNumber(value) !== null).length
+    const dateHits = sample.filter((value) => looksLikeDate(value)).length
+
+    if (numericHits > 0 && numericHits >= sample.length * 0.55) {
+      numeric.push(header)
+      return
+    }
+
+    if (dateHits > 0 && dateHits >= sample.length * 0.45) {
+      temporal.push(header)
+      return
+    }
+
+    categorical.push(header)
+  })
+
+  return { numeric, temporal, categorical }
+}
 
 function toNumber(value: unknown): number | null {
   if (typeof value === 'number' && Number.isFinite(value)) {
@@ -304,6 +448,92 @@ function csvEscape(value: string | number): string {
   return text
 }
 
+function saveSqliteToLocalStorage(db: Database): void {
+  const exported = db.export()
+  localStorage.setItem(SQLITE_DB_STORAGE_KEY, JSON.stringify(Array.from(exported)))
+}
+
+function readSavedViewsFromDb(db: Database): SavedView[] {
+  const result = db.exec(
+    'SELECT id, name, config_json FROM saved_views ORDER BY created_at DESC LIMIT 25',
+  )
+
+  if (result.length === 0) {
+    return []
+  }
+
+  const first = result[0]
+  const idIndex = first.columns.indexOf('id')
+  const nameIndex = first.columns.indexOf('name')
+  const configIndex = first.columns.indexOf('config_json')
+
+  if (idIndex === -1 || nameIndex === -1 || configIndex === -1) {
+    return []
+  }
+
+  return first.values
+    .map((row) => {
+      const id = String(row[idIndex] ?? '')
+      const name = String(row[nameIndex] ?? '')
+      const configText = String(row[configIndex] ?? '{}')
+
+      if (!id || !name) {
+        return null
+      }
+
+      try {
+        const config = JSON.parse(configText) as ViewConfig
+        return { id, name, config }
+      } catch {
+        return null
+      }
+    })
+    .filter((item): item is SavedView => item !== null)
+}
+
+function rebuildSourceTable(db: Database, sourceRows: DataRow[], headers: string[]): void {
+  db.run(`DROP TABLE IF EXISTS ${SQL_TABLE_SOURCE}`)
+
+  if (headers.length === 0) {
+    return
+  }
+
+  const numericFlags = headers.map((header) =>
+    sourceRows.some((row) => toNumber(row[header]) !== null),
+  )
+
+  const createColumns = headers
+    .map((header, index) => `${quoteSqlIdentifier(header)} ${numericFlags[index] ? 'REAL' : 'TEXT'}`)
+    .join(', ')
+  db.run(`CREATE TABLE ${SQL_TABLE_SOURCE} (${createColumns})`)
+
+  const insertColumns = headers.map((header) => quoteSqlIdentifier(header)).join(', ')
+  const placeholders = headers.map(() => '?').join(', ')
+  const stmt = db.prepare(
+    `INSERT INTO ${SQL_TABLE_SOURCE} (${insertColumns}) VALUES (${placeholders})`,
+  )
+
+  sourceRows.forEach((row) => {
+    const values = headers.map((header, index) => {
+      const raw = row[header]
+      if (raw == null) {
+        return null
+      }
+
+      if (numericFlags[index]) {
+        const parsed = toNumber(raw)
+        return parsed ?? null
+      }
+
+      return String(raw)
+    })
+
+    stmt.run(values)
+  })
+
+  stmt.free()
+}
+
 function aggregateRowValue(row: DataRow, measureColumn?: string): number {
   if (!measureColumn) {
     return 1
@@ -426,6 +656,138 @@ function App() {
     selectedSheet: '',
   })
   const [sunburstHoverNode, setSunburstHoverNode] = useState<SunburstData | null>(null)
+  const [sunburstHoverPosition, setSunburstHoverPosition] = useState({ x: 120, y: 120 })
+  const [savedViews, setSavedViews] = useState<SavedView[]>([])
+  const [viewNameInput, setViewNameInput] = useState('')
+  const [dataSourceMode, setDataSourceMode] = useState<DataSourceMode>('pivot')
+  const [wizardGoal, setWizardGoal] = useState<WizardGoal>('compare')
+  const [wizardMetric, setWizardMetric] = useState('')
+  const [wizardDimension, setWizardDimension] = useState('')
+  const [wizardSeries, setWizardSeries] = useState('')
+  const [querySql, setQuerySql] = useState(
+    `SELECT ${quoteSqlIdentifier('Country')} AS category, SUM(${quoteSqlIdentifier('Sales')}) AS value\nFROM ${SQL_TABLE_SOURCE}\nGROUP BY ${quoteSqlIdentifier('Country')}\nORDER BY value DESC\nLIMIT 20`,
+  )
+  const [queryRows, setQueryRows] = useState<Record<string, string | number>[]>([])
+  const [queryColumns, setQueryColumns] = useState<string[]>([])
+  const [queryNotice, setQueryNotice] = useState('')
+  const [sqliteReady, setSqliteReady] = useState(false)
+  const [sqlError, setSqlError] = useState('')
+  const [showLogs, setShowLogs] = useState(false)
+  const [appLogs, setAppLogs] = useState<AppLogEntry[]>([])
+  const importConfigInputRef = useRef<HTMLInputElement | null>(null)
+  const sqliteRef = useRef<Database | null>(null)
+
+  const columnInsights = useMemo(() => getColumnInsights(selectedColumns, rows), [selectedColumns, rows])
+
+  const pushLog = (level: AppLogEntry['level'], message: string) => {
+    const entry: AppLogEntry = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      level,
+      message,
+      timestamp: new Date().toLocaleTimeString(),
+    }
+    setAppLogs((previous) => [entry, ...previous].slice(0, 150))
+  }
+
+  useEffect(() => {
+    try {
+      const serialized = localStorage.getItem(SETTINGS_STORAGE_KEY)
+      if (!serialized) {
+        return
+      }
+
+      const parsed = JSON.parse(serialized) as Partial<{
+        chartType: ChartType
+        pivotAggregation: PivotAggregation
+        pivotSortOrder: PivotSortOrder
+        pivotTopN: number
+      }>
+
+      if (parsed.chartType) {
+        setChartType(parsed.chartType)
+      }
+      if (parsed.pivotAggregation) {
+        setPivotAggregation(parsed.pivotAggregation)
+      }
+      if (parsed.pivotSortOrder) {
+        setPivotSortOrder(parsed.pivotSortOrder)
+      }
+      if (typeof parsed.pivotTopN === 'number' && Number.isFinite(parsed.pivotTopN)) {
+        setPivotTopN(Math.max(0, parsed.pivotTopN))
+      }
+    } catch {
+      // Ignore malformed saved settings.
+    }
+  }, [])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        SETTINGS_STORAGE_KEY,
+        JSON.stringify({
+          chartType,
+          pivotAggregation,
+          pivotSortOrder,
+          pivotTopN,
+        }),
+      )
+    } catch {
+      // Ignore localStorage write errors.
+    }
+  }, [chartType, pivotAggregation, pivotSortOrder, pivotTopN])
+
+  useEffect(() => {
+    let canceled = false
+
+    const setupSqlite = async () => {
+      try {
+        const SQL: SqlJsStatic = await initSqlJs({ locateFile: () => sqlWasmUrl })
+        const serializedDb = localStorage.getItem(SQLITE_DB_STORAGE_KEY)
+        const db = serializedDb
+          ? new SQL.Database(Uint8Array.from(JSON.parse(serializedDb) as number[]))
+          : new SQL.Database()
+
+        db.run(
+          `CREATE TABLE IF NOT EXISTS saved_views (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            config_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          )`,
+        )
+
+        if (canceled) {
+          db.close()
+          return
+        }
+
+        sqliteRef.current = db
+        setSavedViews(readSavedViewsFromDb(db))
+        setSqliteReady(true)
+        pushLog('info', 'SQLite initialized and ready.')
+      } catch {
+        if (!canceled) {
+          setSqlError('SQLite initialization failed. Query mode and DB persistence are unavailable.')
+          setSqliteReady(false)
+          pushLog('error', 'SQLite initialization failed.')
+        }
+      }
+    }
+
+    setupSqlite()
+
+    return () => {
+      canceled = true
+      if (sqliteRef.current) {
+        sqliteRef.current.close()
+        sqliteRef.current = null
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    localStorage.setItem(SAVED_VIEWS_STORAGE_KEY, JSON.stringify(savedViews))
+  }, [savedViews])
 
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -437,6 +799,7 @@ function App() {
     setError('')
     setNotice('')
     setRenderChart(false)
+    pushLog('info', 'File upload started.')
 
     if (!file) {
       return
@@ -488,12 +851,29 @@ function App() {
       setPivotTopN(20)
       setFilterColumn(parsedData.headers[0] ?? '')
       setFilterQuery('')
+      const insights = getColumnInsights(parsedData.headers, parsedData.dataRows)
+      setWizardMetric(insights.numeric[0] ?? parsedData.headers[0] ?? '')
+      setWizardDimension(insights.categorical[0] ?? parsedData.headers[0] ?? '')
+      setWizardSeries(insights.categorical[1] ?? '')
+      setWizardGoal('compare')
       setNotice(parsedData.notice ?? '')
+      pushLog(
+        'info',
+        `File loaded: ${file.name} (${parsedData.dataRows.length.toLocaleString()} rows, ${parsedData.headers.length} columns).`,
+      )
+
+      if (sqliteRef.current) {
+        rebuildSourceTable(sqliteRef.current, parsedData.dataRows, parsedData.headers)
+        saveSqliteToLocalStorage(sqliteRef.current)
+        pushLog('info', `SQLite source table refreshed from ${file.name}.`)
+      }
     } catch (parseError) {
       if (parseError instanceof Error) {
         setError(parseError.message)
+        pushLog('error', `File parse failed: ${parseError.message}`)
       } else {
         setError('Unable to parse the file. Please upload a valid .xlsx, .xls, .csv, or .json file.')
+        pushLog('error', 'File parse failed: unknown error.')
       }
     }
   }
@@ -519,15 +899,29 @@ function App() {
       setPivotTopN(20)
       setFilterColumn(parsedData.headers[0] ?? '')
       setFilterQuery('')
+      const insights = getColumnInsights(parsedData.headers, parsedData.dataRows)
+      setWizardMetric(insights.numeric[0] ?? parsedData.headers[0] ?? '')
+      setWizardDimension(insights.categorical[0] ?? parsedData.headers[0] ?? '')
+      setWizardSeries(insights.categorical[1] ?? '')
+      setWizardGoal('compare')
       setNotice(parsedData.notice ?? '')
       setError('')
       setRenderChart(false)
       setSunburstHoverNode(null)
+      pushLog('info', `Sheet switched to ${nextSheet}.`)
+
+      if (sqliteRef.current) {
+        rebuildSourceTable(sqliteRef.current, parsedData.dataRows, parsedData.headers)
+        saveSqliteToLocalStorage(sqliteRef.current)
+        pushLog('info', `SQLite source table refreshed from sheet ${nextSheet}.`)
+      }
     } catch (parseError) {
       if (parseError instanceof Error) {
         setError(parseError.message)
+        pushLog('error', `Sheet read failed: ${parseError.message}`)
       } else {
         setError('Unable to read the selected sheet. Please try another one.')
+        pushLog('error', 'Sheet read failed: unknown error.')
       }
     }
   }
@@ -581,6 +975,7 @@ function App() {
 
     const rowMap = new Map<string, Map<string, PivotAccumulator>>()
     const seriesOrdered: string[] = []
+    const seenSeries = new Set<string>()
     const effectiveAggregation = shouldFallbackToCount(
       filteredRows,
       pivotValueColumn,
@@ -593,7 +988,8 @@ function App() {
       const rowKey = String(row[pivotRowColumn] ?? 'Unknown')
       const seriesKey = pivotSeriesColumn ? String(row[pivotSeriesColumn] ?? 'Unknown') : 'Value'
 
-      if (!seriesOrdered.includes(seriesKey)) {
+      if (!seenSeries.has(seriesKey)) {
+        seenSeries.add(seriesKey)
         seriesOrdered.push(seriesKey)
       }
 
@@ -676,17 +1072,48 @@ function App() {
   ])
 
   const sunburstData = useMemo(() => {
-    if (!renderChart || chartType !== 'sunburst' || rows.length === 0) {
+    const sourceRows = dataSourceMode === 'query' ? queryRows : rows
+    if (!renderChart || chartType !== 'sunburst' || sourceRows.length === 0) {
       return null
     }
 
-    const hierarchyColumns = selectedColumns.slice(0, 4)
-    const numericMeasure = rows.some((row) => toNumber(row[pivotValueColumn]) !== null)
+    const hierarchyBase = dataSourceMode === 'query' ? queryColumns : selectedColumns
+    const hierarchyColumns = hierarchyBase.slice(0, 4)
+    const numericMeasure = sourceRows.some((row) => toNumber(row[pivotValueColumn]) !== null)
       ? pivotValueColumn
       : undefined
 
-    return buildSunburstHierarchy(rows, hierarchyColumns, numericMeasure)
-  }, [chartType, pivotValueColumn, renderChart, rows, selectedColumns])
+    return buildSunburstHierarchy(sourceRows, hierarchyColumns, numericMeasure)
+  }, [
+    chartType,
+    dataSourceMode,
+    pivotValueColumn,
+    queryColumns,
+    queryRows,
+    renderChart,
+    rows,
+    selectedColumns,
+  ])
+
+  const activeChartModel: ChartModel =
+    dataSourceMode === 'query'
+      ? {
+          chartData: queryRows,
+          pieData: queryRows.map((row, index) => {
+            const label =
+              String(row.name ?? row.label ?? row.category ?? row.xLabel ?? `Row ${index + 1}`)
+            const numericValueColumn = queryColumns.find((column) =>
+              queryRows.some((candidate) => typeof candidate[column] === 'number'),
+            )
+            const value = numericValueColumn ? Number(row[numericValueColumn] ?? 0) : 0
+            return { name: label, value }
+          }),
+          seriesKeys: queryColumns.filter(
+            (column) => column !== 'xLabel' && queryRows.some((row) => typeof row[column] === 'number'),
+          ),
+          filteredRowCount: queryRows.length,
+        }
+      : pivotModel
 
   useEffect(() => {
     if (!renderChart || chartType !== 'sunburst' || !sunburstData) {
@@ -730,6 +1157,56 @@ function App() {
 
   const currentSunburstTotal = currentSunburstNode?.value ?? 0
   const currentSunburstPath = sunburstStack.map((node) => String(node.name))
+  const isSunburstChart = chartType === 'sunburst'
+  const isSeriesChart = chartType === 'bar' || chartType === 'line' || chartType === 'area'
+  const isPieOrScatter = chartType === 'pie' || chartType === 'scatter'
+  const wizardRecommendations = useMemo(() => {
+    const recommendations: Array<{ label: string; message: string; apply: () => void }> = []
+
+    if (columnInsights.temporal.length > 0 && columnInsights.numeric.length > 0) {
+      recommendations.push({
+        label: 'Trend Over Time',
+        message: `${columnInsights.numeric[0]} by ${columnInsights.temporal[0]} as line chart`,
+        apply: () => {
+          setDataSourceMode('wizard')
+          setWizardGoal('trend')
+          setWizardMetric(columnInsights.numeric[0])
+          setWizardDimension(columnInsights.temporal[0])
+          setWizardSeries(columnInsights.categorical[0] ?? '')
+        },
+      })
+    }
+
+    if (columnInsights.categorical.length > 0 && columnInsights.numeric.length > 0) {
+      recommendations.push({
+        label: 'Category Comparison',
+        message: `${columnInsights.numeric[0]} by ${columnInsights.categorical[0]} as bar chart`,
+        apply: () => {
+          setDataSourceMode('wizard')
+          setWizardGoal('compare')
+          setWizardMetric(columnInsights.numeric[0])
+          setWizardDimension(columnInsights.categorical[0])
+          setWizardSeries(columnInsights.categorical[1] ?? '')
+        },
+      })
+    }
+
+    if (columnInsights.categorical.length > 1 && columnInsights.numeric.length > 0) {
+      recommendations.push({
+        label: 'Hierarchy Breakdown',
+        message: `${columnInsights.numeric[0]} across ${columnInsights.categorical[0]} -> ${columnInsights.categorical[1]}`,
+        apply: () => {
+          setDataSourceMode('wizard')
+          setWizardGoal('hierarchy')
+          setWizardMetric(columnInsights.numeric[0])
+          setWizardDimension(columnInsights.categorical[0])
+          setWizardSeries(columnInsights.categorical[1])
+        },
+      })
+    }
+
+    return recommendations.slice(0, 3)
+  }, [columnInsights])
 
   const submitConfiguration = () => {
     if (chartType === 'sunburst' && selectedColumns.length === 0) {
@@ -749,21 +1226,259 @@ function App() {
 
     setError('')
     setRenderChart(true)
+    pushLog('info', `Rendered ${chartType} chart using ${dataSourceMode} mode.`)
   }
 
-  const downloadPivotCsv = () => {
-    if (pivotModel.chartData.length === 0) {
-      setError('No pivot rows available to export.')
+  const applyWizardTemplate = (template: WizardTemplate) => {
+    setDataSourceMode('wizard')
+    setWizardGoal(template.goal)
+
+    if (template.goal === 'trend') {
+      setWizardDimension(columnInsights.temporal[0] ?? columnInsights.categorical[0] ?? selectedColumns[0] ?? '')
+      setWizardMetric(columnInsights.numeric[0] ?? selectedColumns[0] ?? '')
+      setWizardSeries(columnInsights.categorical[0] ?? '')
       return
     }
 
-    const headers = ['Row', ...pivotModel.seriesKeys, 'Total']
+    setWizardDimension(columnInsights.categorical[0] ?? selectedColumns[0] ?? '')
+    setWizardMetric(columnInsights.numeric[0] ?? selectedColumns[0] ?? '')
+    setWizardSeries(columnInsights.categorical[1] ?? '')
+  }
+
+  const renderFromWizard = () => {
+    if (!wizardDimension) {
+      setError('Guided Builder needs a category/time field.')
+      return
+    }
+
+    if (!wizardMetric) {
+      setError('Guided Builder needs a metric/value field.')
+      return
+    }
+
+    setDataSourceMode('pivot')
+    setPivotRowColumn(wizardDimension)
+    setPivotValueColumn(wizardMetric)
+    setPivotSeriesColumn(wizardSeries)
+
+    if (wizardGoal === 'compare') {
+      setChartType('bar')
+      setPivotAggregation('sum')
+    } else if (wizardGoal === 'trend') {
+      setChartType('line')
+      setPivotAggregation('sum')
+    } else if (wizardGoal === 'composition') {
+      setChartType('pie')
+      setPivotSeriesColumn('')
+      setPivotAggregation('sum')
+    } else if (wizardGoal === 'relationship') {
+      setChartType('scatter')
+      setPivotSeriesColumn('')
+      setPivotAggregation('avg')
+    } else {
+      setChartType('sunburst')
+      const hierarchy = [wizardDimension, wizardSeries]
+        .filter((item) => item && selectedColumns.includes(item))
+        .concat(selectedColumns.filter((item) => item !== wizardDimension && item !== wizardSeries))
+      setSelectedColumns(hierarchy)
+    }
+
+    setError('')
+    setRenderChart(true)
+    pushLog('info', `Guided Builder rendered ${wizardGoal} visualization.`)
+  }
+
+  const handleChartMouseMove = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (chartType !== 'sunburst' || !sunburstHoverNode) {
+      return
+    }
+
+    const rect = event.currentTarget.getBoundingClientRect()
+    const x = event.clientX - rect.left
+    const y = event.clientY - rect.top
+    setSunburstHoverPosition({ x, y })
+  }
+
+  const resetPivotControls = () => {
+    const defaults = {
+      row: selectedColumns[0] ?? '',
+      value: pickDefaultValueColumn(selectedColumns, rows),
+      filter: selectedColumns[0] ?? '',
+    }
+
+    setPivotRowColumn(defaults.row)
+    setPivotSeriesColumn('')
+    setPivotValueColumn(defaults.value)
+    setPivotAggregation('count')
+    setPivotSortOrder('desc')
+    setPivotTopN(20)
+    setFilterColumn(defaults.filter)
+    setFilterQuery('')
+    setRenderChart(false)
+    pushLog('info', 'Pivot controls reset to defaults.')
+  }
+
+  const buildCurrentViewConfig = (): ViewConfig => ({
+    chartType,
+    dataSourceMode,
+    pivotRowColumn,
+    pivotSeriesColumn,
+    pivotValueColumn,
+    pivotAggregation,
+    pivotSortOrder,
+    pivotTopN,
+    filterColumn,
+    filterQuery,
+    querySql,
+    wizardGoal,
+    wizardMetric,
+    wizardDimension,
+    wizardSeries,
+    selectedColumns,
+  })
+
+  const applyViewConfig = (config: ViewConfig) => {
+    setChartType(config.chartType)
+    setDataSourceMode(config.dataSourceMode ?? 'pivot')
+    setPivotRowColumn(config.pivotRowColumn)
+    setPivotSeriesColumn(config.pivotSeriesColumn)
+    setPivotValueColumn(config.pivotValueColumn)
+    setPivotAggregation(config.pivotAggregation)
+    setPivotSortOrder(config.pivotSortOrder)
+    setPivotTopN(Math.max(0, config.pivotTopN))
+    setFilterColumn(config.filterColumn)
+    setFilterQuery(config.filterQuery)
+    setQuerySql(config.querySql ?? querySql)
+    setWizardGoal(config.wizardGoal ?? wizardGoal)
+    setWizardMetric(config.wizardMetric ?? wizardMetric)
+    setWizardDimension(config.wizardDimension ?? wizardDimension)
+    setWizardSeries(config.wizardSeries ?? wizardSeries)
+    if (Array.isArray(config.selectedColumns) && config.selectedColumns.length > 0) {
+      setSelectedColumns(config.selectedColumns)
+    }
+    setRenderChart(false)
+    setError('')
+  }
+
+  const saveCurrentView = () => {
+    const name = viewNameInput.trim()
+    if (!name) {
+      setError('Please enter a name before saving a view.')
+      pushLog('error', 'Save view failed: missing name.')
+      return
+    }
+
+    const nextView: SavedView = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      config: buildCurrentViewConfig(),
+    }
+
+    if (sqliteRef.current) {
+      sqliteRef.current.run(
+        'INSERT OR REPLACE INTO saved_views (id, name, config_json, created_at) VALUES (?, ?, ?, ?)',
+        [nextView.id, nextView.name, JSON.stringify(nextView.config), new Date().toISOString()],
+      )
+      saveSqliteToLocalStorage(sqliteRef.current)
+      setSavedViews(readSavedViewsFromDb(sqliteRef.current))
+      setViewNameInput('')
+      setError('')
+      pushLog('info', `Saved view "${name}" to SQLite.`)
+      return
+    }
+
+    setSavedViews((previous) => [nextView, ...previous].slice(0, 25))
+    setViewNameInput('')
+    setError('')
+    pushLog('info', `Saved view "${name}" to local state.`)
+  }
+
+  const loadSavedView = (viewId: string) => {
+    const target = savedViews.find((view) => view.id === viewId)
+    if (!target) {
+      return
+    }
+    applyViewConfig(target.config)
+    pushLog('info', `Loaded saved view "${target.name}".`)
+  }
+
+  const deleteSavedView = (viewId: string) => {
+    if (sqliteRef.current) {
+      sqliteRef.current.run('DELETE FROM saved_views WHERE id = ?', [viewId])
+      saveSqliteToLocalStorage(sqliteRef.current)
+      setSavedViews(readSavedViewsFromDb(sqliteRef.current))
+      pushLog('info', 'Deleted saved view from SQLite.')
+      return
+    }
+
+    setSavedViews((previous) => previous.filter((view) => view.id !== viewId))
+    pushLog('info', 'Deleted saved view.')
+  }
+
+  const exportCurrentConfig = () => {
+    const payload = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      config: buildCurrentViewConfig(),
+    }
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${fileName.replace(/\.[^.]+$/, '') || 'chart'}-config.json`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+    pushLog('info', 'Exported current config JSON.')
+  }
+
+  const handleImportConfig = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) {
+      return
+    }
+
+    try {
+      const text = await file.text()
+      const parsed = JSON.parse(text) as Partial<{ config: ViewConfig } & ViewConfig>
+      const config = (parsed.config ?? parsed) as ViewConfig
+
+      if (!config || !config.chartType || !config.pivotRowColumn) {
+        setError('Invalid config file format.')
+        pushLog('error', 'Import config failed: invalid format.')
+        return
+      }
+
+      applyViewConfig(config)
+      pushLog('info', 'Imported chart config JSON.')
+    } catch {
+      setError('Unable to import config. Please select a valid JSON file.')
+      pushLog('error', 'Import config failed: unreadable JSON.')
+    } finally {
+      event.target.value = ''
+    }
+  }
+
+  const downloadPivotCsv = () => {
+    if (activeChartModel.chartData.length === 0) {
+      setError('No pivot rows available to export.')
+      pushLog('error', 'Export CSV failed: no data rows available.')
+      return
+    }
+
+    const headers = ['Row', ...activeChartModel.seriesKeys, 'Total']
     const lines = [headers.map((item) => csvEscape(item)).join(',')]
 
-    pivotModel.chartData.forEach((entry) => {
+    activeChartModel.chartData.forEach((entry) => {
       const rowValues = [
         csvEscape(String(entry.xLabel ?? '')),
-        ...pivotModel.seriesKeys.map((seriesKey) => csvEscape(Number(entry[seriesKey] ?? 0))),
+        ...activeChartModel.seriesKeys.map((seriesKey) =>
+          csvEscape(Number(entry[seriesKey] ?? 0)),
+        ),
         csvEscape(Number(entry.total ?? 0)),
       ]
       lines.push(rowValues.join(','))
@@ -778,6 +1493,68 @@ function App() {
     link.click()
     document.body.removeChild(link)
     URL.revokeObjectURL(url)
+    pushLog('info', `Exported ${activeChartModel.chartData.length.toLocaleString()} rows to CSV.`)
+  }
+
+  const runSqlQuery = () => {
+    if (!sqliteRef.current) {
+      setSqlError('SQLite is not ready yet.')
+      pushLog('error', 'SQL query failed: SQLite not ready.')
+      return
+    }
+
+    const trimmed = querySql.trim()
+    if (!trimmed) {
+      setSqlError('Please enter a SQL query.')
+      pushLog('error', 'SQL query failed: query is empty.')
+      return
+    }
+
+    const startsWithSelect = /^select\b/i.test(trimmed)
+    const startsWithWith = /^with\b/i.test(trimmed)
+    if (!startsWithSelect && !startsWithWith) {
+      setSqlError('Only read-only SELECT/CTE queries are allowed.')
+      pushLog('error', 'SQL query rejected: only SELECT/CTE allowed.')
+      return
+    }
+
+    try {
+      const result = sqliteRef.current.exec(trimmed)
+      if (result.length === 0) {
+        setQueryColumns([])
+        setQueryRows([])
+        setQueryNotice('Query executed successfully but returned no rows.')
+        setSqlError('')
+        pushLog('info', 'SQL query executed with zero rows returned.')
+        return
+      }
+
+      const first = result[0] as QueryExecResult
+      const mapped = first.values.map((row) => {
+        const next: Record<string, string | number> = {}
+        first.columns.forEach((column, index) => {
+          const value = row[index]
+          next[column] = typeof value === 'number' ? value : value == null ? '' : String(value)
+        })
+        return next
+      })
+
+      setQueryColumns(first.columns)
+      setQueryRows(mapped)
+      setQueryNotice(`Query returned ${mapped.length.toLocaleString()} rows.`)
+      setSqlError('')
+      setDataSourceMode('query')
+      setRenderChart(true)
+      pushLog('info', `SQL query executed successfully (${mapped.length.toLocaleString()} rows).`)
+    } catch (queryError) {
+      if (queryError instanceof Error) {
+        setSqlError(queryError.message)
+        pushLog('error', `SQL query failed: ${queryError.message}`)
+      } else {
+        setSqlError('Query failed to execute.')
+        pushLog('error', 'SQL query failed: unknown error.')
+      }
+    }
   }
 
   return (
@@ -856,12 +1633,17 @@ function App() {
           <article className="card">
             <h2>Chart Setup</h2>
             <div className="form-grid">
-              <label>
-                Chart Type
+              <div className="compact-field">
+                <label htmlFor="chart-type">Chart Type</label>
                 <select
+                  id="chart-type"
                   value={chartType}
                   onChange={(event) => {
-                    setChartType(event.target.value as ChartType)
+                    const nextChartType = event.target.value as ChartType
+                    setChartType(nextChartType)
+                    if (nextChartType === 'pie' || nextChartType === 'scatter') {
+                      setPivotSeriesColumn('')
+                    }
                     setRenderChart(false)
                   }}
                 >
@@ -872,153 +1654,425 @@ function App() {
                   <option value="pie">Pie</option>
                   <option value="sunburst">Sunburst</option>
                 </select>
-              </label>
+              </div>
 
-              <label>
-                Pivot Rows
+              <div className="compact-field">
+                <label htmlFor="data-source-mode">Data Source</label>
                 <select
-                  value={pivotRowColumn}
+                  id="data-source-mode"
+                  value={dataSourceMode}
                   onChange={(event) => {
-                    setPivotRowColumn(event.target.value)
+                    setDataSourceMode(event.target.value as DataSourceMode)
                     setRenderChart(false)
+                    setSqlError('')
                   }}
                 >
-                  {selectedColumns.map((column) => (
-                    <option key={column} value={column}>
-                      {column}
-                    </option>
-                  ))}
+                  <option value="pivot">Pivot Builder</option>
+                  <option value="query">SQL Query</option>
+                  <option value="wizard">Guided Builder</option>
                 </select>
-              </label>
+              </div>
 
-              <label>
-                Pivot Columns (Series)
-                <select
-                  value={pivotSeriesColumn}
-                  onChange={(event) => {
-                    setPivotSeriesColumn(event.target.value)
-                    setRenderChart(false)
-                  }}
-                >
-                  <option value="">(None)</option>
-                  {selectedColumns.map((column) => (
-                    <option key={column} value={column}>
-                      {column}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              {dataSourceMode === 'wizard' ? (
+                <div className="wizard-panel">
+                  <h3>Guided Builder</h3>
+                  <p className="subtle">
+                    Choose what you want to understand. The app configures chart fields for you.
+                  </p>
 
-              <label>
-                Pivot Values
-                <select
-                  value={pivotValueColumn}
-                  onChange={(event) => {
-                    setPivotValueColumn(event.target.value)
-                    setRenderChart(false)
-                  }}
-                >
-                  {selectedColumns.map((column) => (
-                    <option key={column} value={column}>
-                      {column}
-                    </option>
-                  ))}
-                </select>
-              </label>
+                  {wizardRecommendations.length > 0 ? (
+                    <div className="wizard-recommendations">
+                      {wizardRecommendations.map((item) => (
+                        <button
+                          key={item.label}
+                          type="button"
+                          className="wizard-chip"
+                          onClick={item.apply}
+                        >
+                          <strong>{item.label}</strong>
+                          <span>{item.message}</span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
 
-              <label>
-                Aggregation
-                <select
-                  value={pivotAggregation}
-                  onChange={(event) => {
-                    setPivotAggregation(event.target.value as PivotAggregation)
-                    setRenderChart(false)
-                  }}
-                >
-                  <option value="sum">Sum</option>
-                  <option value="count">Count</option>
-                  <option value="countDistinct">Count Distinct</option>
-                  <option value="avg">Average</option>
-                  <option value="min">Minimum</option>
-                  <option value="max">Maximum</option>
-                </select>
-              </label>
+                  <div className="wizard-template-grid">
+                    {WIZARD_TEMPLATES.map((template) => (
+                      <button
+                        key={template.id}
+                        type="button"
+                        className="wizard-template"
+                        onClick={() => applyWizardTemplate(template)}
+                      >
+                        <strong>{template.label}</strong>
+                        <span>{template.description}</span>
+                      </button>
+                    ))}
+                  </div>
 
-              <label>
-                Filter Field
-                <select
-                  value={filterColumn}
-                  onChange={(event) => {
-                    setFilterColumn(event.target.value)
-                    setRenderChart(false)
-                  }}
-                >
-                  {selectedColumns.map((column) => (
-                    <option key={column} value={column}>
-                      {column}
-                    </option>
-                  ))}
-                </select>
-              </label>
+                  <div className="compact-field">
+                    <label htmlFor="wizard-goal">Goal</label>
+                    <select
+                      id="wizard-goal"
+                      value={wizardGoal}
+                      onChange={(event) => setWizardGoal(event.target.value as WizardGoal)}
+                    >
+                      <option value="compare">Compare categories</option>
+                      <option value="trend">Trend over time</option>
+                      <option value="composition">Part-to-whole</option>
+                      <option value="relationship">Relationship (scatter)</option>
+                      <option value="hierarchy">Hierarchy (sunburst)</option>
+                    </select>
+                  </div>
 
-              <label>
-                Filter Contains
-                <input
-                  type="text"
-                  value={filterQuery}
-                  placeholder="e.g. india"
-                  onChange={(event) => {
-                    setFilterQuery(event.target.value)
-                    setRenderChart(false)
-                  }}
-                />
-              </label>
+                  <div className="compact-field">
+                    <label htmlFor="wizard-dimension">Category/Time</label>
+                    <select
+                      id="wizard-dimension"
+                      value={wizardDimension}
+                      onChange={(event) => setWizardDimension(event.target.value)}
+                    >
+                      {selectedColumns.map((column) => (
+                        <option key={`wiz-dim-${column}`} value={column}>
+                          {column}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
 
-              <label>
-                Sort Rows by Total
-                <select
-                  value={pivotSortOrder}
-                  onChange={(event) => {
-                    setPivotSortOrder(event.target.value as PivotSortOrder)
-                    setRenderChart(false)
-                  }}
-                >
-                  <option value="desc">High to Low</option>
-                  <option value="asc">Low to High</option>
-                  <option value="none">Original</option>
-                </select>
-              </label>
+                  <div className="compact-field">
+                    <label htmlFor="wizard-metric">Metric</label>
+                    <select
+                      id="wizard-metric"
+                      value={wizardMetric}
+                      onChange={(event) => setWizardMetric(event.target.value)}
+                    >
+                      {selectedColumns.map((column) => (
+                        <option key={`wiz-metric-${column}`} value={column}>
+                          {column}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
 
-              <label>
-                Top N Rows (0 = all)
-                <input
-                  type="number"
-                  min={0}
-                  value={pivotTopN}
-                  onChange={(event) => {
-                    const parsed = Number(event.target.value)
-                    setPivotTopN(Number.isFinite(parsed) && parsed >= 0 ? parsed : 0)
-                    setRenderChart(false)
-                  }}
-                />
-              </label>
+                  <div className="compact-field">
+                    <label htmlFor="wizard-series">Optional Split</label>
+                    <select
+                      id="wizard-series"
+                      value={wizardSeries}
+                      onChange={(event) => setWizardSeries(event.target.value)}
+                    >
+                      <option value="">(None)</option>
+                      {selectedColumns.map((column) => (
+                        <option key={`wiz-series-${column}`} value={column}>
+                          {column}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
 
-              <button type="button" className="submit-btn" onClick={submitConfiguration}>
-                Render Interactive Chart
-              </button>
-              {chartType === 'sunburst' && (
+                  <div className="wizard-actions">
+                    <button type="button" className="submit-btn" onClick={renderFromWizard}>
+                      Build Chart From Wizard
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+
+              {dataSourceMode === 'query' ? (
+                <div className="query-panel">
+                  <label htmlFor="query-sql">SQL (table: uploaded_data)</label>
+                  <textarea
+                    id="query-sql"
+                    value={querySql}
+                    onChange={(event) => setQuerySql(event.target.value)}
+                    rows={8}
+                    spellCheck={false}
+                  />
+                  <div className="query-panel-actions">
+                    <button type="button" className="submit-btn" onClick={runSqlQuery}>
+                      Run Query and Visualize
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-btn"
+                      onClick={() => {
+                        setQuerySql(
+                          `SELECT ${quoteSqlIdentifier('Country')} AS category, SUM(${quoteSqlIdentifier('Sales')}) AS value\nFROM ${SQL_TABLE_SOURCE}\nGROUP BY ${quoteSqlIdentifier('Country')}\nORDER BY value DESC\nLIMIT 20`,
+                        )
+                      }}
+                    >
+                      Load Example Query
+                    </button>
+                  </div>
+                  {queryNotice ? <p className="notice">{queryNotice}</p> : null}
+                  {sqlError ? <p className="error">{sqlError}</p> : null}
+                  {!sqliteReady ? (
+                    <p className="subtle">SQLite is still loading. Query mode will activate soon.</p>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {dataSourceMode === 'pivot' && isSunburstChart ? (
+                <>
+                  <div className="compact-field">
+                    <label htmlFor="sunburst-value-field">Value Field</label>
+                    <select
+                      id="sunburst-value-field"
+                      value={pivotValueColumn}
+                      onChange={(event) => {
+                        setPivotValueColumn(event.target.value)
+                        setRenderChart(false)
+                      }}
+                    >
+                      {selectedColumns.map((column) => (
+                        <option key={column} value={column}>
+                          {column}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <p className="subtle">
+                    Hierarchy comes from your arranged columns (first 4), and Value Field is used
+                    as the measure when numeric.
+                  </p>
+                </>
+              ) : null}
+
+              {dataSourceMode === 'pivot' && !isSunburstChart ? (
+                <>
+                  <div className="compact-field">
+                    <label htmlFor="pivot-rows">Rows</label>
+                    <select
+                      id="pivot-rows"
+                      value={pivotRowColumn}
+                      onChange={(event) => {
+                        setPivotRowColumn(event.target.value)
+                        setRenderChart(false)
+                      }}
+                    >
+                      {selectedColumns.map((column) => (
+                        <option key={column} value={column}>
+                          {column}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {isSeriesChart ? (
+                    <div className="compact-field">
+                      <label htmlFor="pivot-series">Series</label>
+                      <select
+                        id="pivot-series"
+                        value={pivotSeriesColumn}
+                        onChange={(event) => {
+                          setPivotSeriesColumn(event.target.value)
+                          setRenderChart(false)
+                        }}
+                      >
+                        <option value="">(None)</option>
+                        {selectedColumns.map((column) => (
+                          <option key={column} value={column}>
+                            {column}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : null}
+
+                  <div className="compact-field">
+                    <label htmlFor="pivot-values">Values</label>
+                    <select
+                      id="pivot-values"
+                      value={pivotValueColumn}
+                      onChange={(event) => {
+                        setPivotValueColumn(event.target.value)
+                        setRenderChart(false)
+                      }}
+                    >
+                      {selectedColumns.map((column) => (
+                        <option key={column} value={column}>
+                          {column}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="compact-field">
+                    <label htmlFor="pivot-aggregation">Aggregation</label>
+                    <select
+                      id="pivot-aggregation"
+                      value={pivotAggregation}
+                      onChange={(event) => {
+                        setPivotAggregation(event.target.value as PivotAggregation)
+                        setRenderChart(false)
+                      }}
+                    >
+                      <option value="sum">Sum</option>
+                      <option value="count">Count</option>
+                      <option value="countDistinct">Count Distinct</option>
+                      <option value="avg">Average</option>
+                      <option value="min">Minimum</option>
+                      <option value="max">Maximum</option>
+                    </select>
+                  </div>
+
+                  <div className="compact-field">
+                    <label htmlFor="filter-field">Filter Field</label>
+                    <select
+                      id="filter-field"
+                      value={filterColumn}
+                      onChange={(event) => {
+                        setFilterColumn(event.target.value)
+                        setRenderChart(false)
+                      }}
+                    >
+                      {selectedColumns.map((column) => (
+                        <option key={column} value={column}>
+                          {column}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="compact-field">
+                    <label htmlFor="filter-query">Filter Contains</label>
+                    <input
+                      id="filter-query"
+                      type="text"
+                      value={filterQuery}
+                      placeholder="e.g. india"
+                      onChange={(event) => {
+                        setFilterQuery(event.target.value)
+                        setRenderChart(false)
+                      }}
+                    />
+                  </div>
+
+                  <div className="compact-field">
+                    <label htmlFor="sort-order">Sort by Total</label>
+                    <select
+                      id="sort-order"
+                      value={pivotSortOrder}
+                      onChange={(event) => {
+                        setPivotSortOrder(event.target.value as PivotSortOrder)
+                        setRenderChart(false)
+                      }}
+                    >
+                      <option value="desc">High to Low</option>
+                      <option value="asc">Low to High</option>
+                      <option value="none">Original</option>
+                    </select>
+                  </div>
+
+                  <div className="compact-field">
+                    <label htmlFor="top-n">Top N (0 = all)</label>
+                    <input
+                      id="top-n"
+                      type="number"
+                      min={0}
+                      value={pivotTopN}
+                      onChange={(event) => {
+                        const parsed = Number(event.target.value)
+                        setPivotTopN(Number.isFinite(parsed) && parsed >= 0 ? parsed : 0)
+                        setRenderChart(false)
+                      }}
+                    />
+                  </div>
+                </>
+              ) : null}
+
+              {dataSourceMode === 'pivot' ? (
+                <button type="button" className="submit-btn" onClick={submitConfiguration}>
+                  Render Interactive Chart
+                </button>
+              ) : null}
+              {dataSourceMode === 'pivot' && chartType !== 'sunburst' && (
+                <button type="button" className="secondary-btn" onClick={resetPivotControls}>
+                  Reset Pivot Controls
+                </button>
+              )}
+              {dataSourceMode === 'pivot' && !isSunburstChart && (
+                <div className="view-manager">
+                  <h3>Saved Views</h3>
+                  <div className="view-row">
+                    <input
+                      type="text"
+                      placeholder="View name"
+                      value={viewNameInput}
+                      onChange={(event) => setViewNameInput(event.target.value)}
+                    />
+                    <button type="button" className="secondary-btn" onClick={saveCurrentView}>
+                      Save View
+                    </button>
+                  </div>
+                  <div className="view-actions">
+                    <button type="button" className="toolbar-btn" onClick={exportCurrentConfig}>
+                      Export Config
+                    </button>
+                    <button
+                      type="button"
+                      className="toolbar-btn"
+                      onClick={() => importConfigInputRef.current?.click()}
+                    >
+                      Import Config
+                    </button>
+                    <input
+                      ref={importConfigInputRef}
+                      type="file"
+                      accept="application/json,.json"
+                      className="hidden-file-input"
+                      onChange={handleImportConfig}
+                    />
+                  </div>
+                  {savedViews.length > 0 ? (
+                    <ul className="saved-view-list">
+                      {savedViews.map((view) => (
+                        <li key={view.id}>
+                          <span>{view.name}</span>
+                          <div className="saved-view-buttons">
+                            <button
+                              type="button"
+                              className="toolbar-btn"
+                              onClick={() => loadSavedView(view.id)}
+                            >
+                              Load
+                            </button>
+                            <button
+                              type="button"
+                              className="toolbar-btn"
+                              onClick={() => deleteSavedView(view.id)}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="subtle">No saved views yet.</p>
+                  )}
+                </div>
+              )}
+              {isSunburstChart && (
                 <p className="subtle">
-                  Sunburst uses your arranged columns as hierarchy (up to first 4 levels).
+                  Sunburst focuses on hierarchy + measure and does not use pivot filter/sort fields.
                 </p>
               )}
-              {chartType !== 'sunburst' && (
+              {dataSourceMode === 'wizard' && (
                 <p className="subtle">
-                  Pivot chart uses Rows as category axis, Columns as series, Values as measure,
-                  and Aggregation to summarize records. For text-only value fields, non-count
-                  aggregations automatically fall back to Count.
+                  Guided Builder is designed for non-technical users and maps your choices to chart
+                  setup automatically.
                 </p>
               )}
-              {chartType !== 'sunburst' && (
+              {dataSourceMode === 'pivot' && !isSunburstChart && (
+                <p className="subtle">
+                  {isPieOrScatter
+                    ? 'This chart uses compact pivot setup: Rows + Values + Aggregation, with filter/sort applied.'
+                    : 'This chart uses full pivot setup: Rows + Series + Values + Aggregation, with filter/sort applied.'}
+                </p>
+              )}
+              {dataSourceMode === 'pivot' && !isSunburstChart && (
                 <p className="subtle">
                   Filtered records: {pivotModel.filteredRowCount.toLocaleString()} /{' '}
                   {rows.length.toLocaleString()}
@@ -1062,40 +2116,45 @@ function App() {
               </p>
             </div>
           )}
-          {chartType === 'sunburst' && currentSunburstNode && (
-            <div className="sunburst-hover-panel" role="status" aria-live="polite">
-              {sunburstHoverNode ? (
-                <>
-                  <p>
-                    <strong>Segment:</strong> {String(sunburstHoverNode.name)}
-                  </p>
-                  <p>
-                    <strong>Value:</strong> {(sunburstHoverNode.value ?? 0).toLocaleString()}
-                  </p>
-                  <p>
-                    <strong>Share of current view:</strong>{' '}
-                    {currentSunburstTotal > 0
-                      ? `${(((sunburstHoverNode.value ?? 0) / currentSunburstTotal) * 100).toFixed(2)}%`
-                      : '0.00%'}
-                  </p>
-                  <p>
-                    <strong>Path:</strong>{' '}
-                    {[...currentSunburstPath, String(sunburstHoverNode.name)].join(' / ')}
-                  </p>
-                </>
-              ) : (
+          <div className="chart-wrap" onMouseMove={handleChartMouseMove}>
+            {chartType === 'sunburst' && sunburstHoverNode ? (
+              <div
+                className="sunburst-callout"
+                role="status"
+                aria-live="polite"
+                style={{
+                  left: `${sunburstHoverPosition.x}px`,
+                  top: `${sunburstHoverPosition.y}px`,
+                }}
+              >
                 <p>
-                  Hover any segment to view its value, share, and hierarchy path. Click a segment
-                  to drill down.
+                  <strong>Segment:</strong> {String(sunburstHoverNode.name)}
                 </p>
-              )}
-            </div>
-          )}
-          <div className="chart-wrap">
+                <p>
+                  <strong>Value:</strong> {(sunburstHoverNode.value ?? 0).toLocaleString()}
+                </p>
+                <p>
+                  <strong>Share:</strong>{' '}
+                  {currentSunburstTotal > 0
+                    ? `${(((sunburstHoverNode.value ?? 0) / currentSunburstTotal) * 100).toFixed(2)}%`
+                    : '0.00%'}
+                </p>
+                <p>
+                  <strong>Path:</strong>{' '}
+                  {[...currentSunburstPath, String(sunburstHoverNode.name)].join(' / ')}
+                </p>
+              </div>
+            ) : null}
+            {chartType !== 'sunburst' && activeChartModel.chartData.length === 0 ? (
+              <div className="empty-state">
+                <p>No chart data available for current filters/settings.</p>
+                <p>Try clearing filters, changing aggregation, or increasing Top N.</p>
+              </div>
+            ) : null}
             <ResponsiveContainer width="100%" height="100%">
               {chartType === 'bar' ? (
                 <BarChart
-                  data={pivotModel.chartData}
+                  data={activeChartModel.chartData}
                   margin={{ top: 16, right: 20, bottom: 24, left: 8 }}
                 >
                   <CartesianGrid strokeDasharray="4 4" />
@@ -1103,7 +2162,7 @@ function App() {
                   <YAxis />
                   <Tooltip />
                   <Legend />
-                  {pivotModel.seriesKeys.map((col, index) => (
+                  {activeChartModel.seriesKeys.map((col, index) => (
                     <Bar key={col} dataKey={col} fill={COLORS[index % COLORS.length]} />
                   ))}
                 </BarChart>
@@ -1111,7 +2170,7 @@ function App() {
 
               {chartType === 'line' ? (
                 <LineChart
-                  data={pivotModel.chartData}
+                  data={activeChartModel.chartData}
                   margin={{ top: 16, right: 20, bottom: 24, left: 8 }}
                 >
                   <CartesianGrid strokeDasharray="4 4" />
@@ -1119,7 +2178,7 @@ function App() {
                   <YAxis />
                   <Tooltip />
                   <Legend />
-                  {pivotModel.seriesKeys.map((col, index) => (
+                  {activeChartModel.seriesKeys.map((col, index) => (
                     <Line
                       key={col}
                       dataKey={col}
@@ -1134,7 +2193,7 @@ function App() {
 
               {chartType === 'area' ? (
                 <AreaChart
-                  data={pivotModel.chartData}
+                  data={activeChartModel.chartData}
                   margin={{ top: 16, right: 20, bottom: 24, left: 8 }}
                 >
                   <CartesianGrid strokeDasharray="4 4" />
@@ -1142,7 +2201,7 @@ function App() {
                   <YAxis />
                   <Tooltip />
                   <Legend />
-                  {pivotModel.seriesKeys.map((col, index) => (
+                  {activeChartModel.seriesKeys.map((col, index) => (
                     <Area
                       key={col}
                       dataKey={col}
@@ -1160,15 +2219,15 @@ function App() {
                   <CartesianGrid strokeDasharray="4 4" />
                   <XAxis dataKey="xLabel" name={pivotRowColumn} type="category" />
                   <YAxis
-                    dataKey={pivotModel.seriesKeys[0]}
-                    name={pivotModel.seriesKeys[0] ?? 'Value'}
+                    dataKey={activeChartModel.seriesKeys[0]}
+                    name={activeChartModel.seriesKeys[0] ?? 'Value'}
                   />
                   <Tooltip cursor={{ strokeDasharray: '3 3' }} />
                   <Legend />
                   <Scatter
-                    data={pivotModel.chartData}
+                    data={activeChartModel.chartData}
                     fill={COLORS[0]}
-                    name={pivotModel.seriesKeys[0] ?? 'Value'}
+                    name={activeChartModel.seriesKeys[0] ?? 'Value'}
                   />
                 </ScatterChart>
               ) : null}
@@ -1178,14 +2237,14 @@ function App() {
                   <Tooltip />
                   <Legend />
                   <Pie
-                    data={pivotModel.pieData}
+                    data={activeChartModel.pieData}
                     dataKey="value"
                     nameKey="name"
                     outerRadius={140}
                     innerRadius={50}
                     label
                   >
-                    {pivotModel.pieData.map((entry, index) => (
+                    {activeChartModel.pieData.map((entry, index) => (
                       <Cell
                         key={`${String(entry.name)}-${index}`}
                         fill={COLORS[index % COLORS.length]}
@@ -1212,7 +2271,7 @@ function App() {
               ) : null}
             </ResponsiveContainer>
           </div>
-          {chartType !== 'sunburst' && pivotModel.chartData.length > 0 && (
+          {chartType !== 'sunburst' && activeChartModel.chartData.length > 0 && (
             <div className="pivot-preview">
               <h3>Pivot Data Preview</h3>
               <div className="pivot-preview-scroll">
@@ -1220,17 +2279,17 @@ function App() {
                   <thead>
                     <tr>
                       <th>Row</th>
-                      {pivotModel.seriesKeys.map((series) => (
+                      {activeChartModel.seriesKeys.map((series) => (
                         <th key={`head-${series}`}>{series}</th>
                       ))}
                       <th>Total</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {pivotModel.chartData.slice(0, 30).map((entry) => (
+                    {activeChartModel.chartData.slice(0, 30).map((entry) => (
                       <tr key={`row-${String(entry.xLabel)}`}>
                         <td>{String(entry.xLabel)}</td>
-                        {pivotModel.seriesKeys.map((series) => (
+                        {activeChartModel.seriesKeys.map((series) => (
                           <td key={`cell-${String(entry.xLabel)}-${series}`}>
                             {Number(entry[series] ?? 0).toLocaleString()}
                           </td>
@@ -1241,15 +2300,48 @@ function App() {
                   </tbody>
                 </table>
               </div>
-              {pivotModel.chartData.length > 30 && (
+              {activeChartModel.chartData.length > 30 && (
                 <p className="subtle">
-                  Showing first 30 rows out of {pivotModel.chartData.length.toLocaleString()}.
+                  Showing first 30 rows out of {activeChartModel.chartData.length.toLocaleString()}.
                 </p>
               )}
             </div>
           )}
         </section>
       )}
+
+      <section className="card logs-card">
+        <div className="logs-header">
+          <h2>Activity Logs</h2>
+          <div className="logs-actions">
+            <button
+              type="button"
+              className="toolbar-btn"
+              onClick={() => setShowLogs((previous) => !previous)}
+            >
+              {showLogs ? 'Hide Logs' : 'Show Logs'}
+            </button>
+            <button type="button" className="toolbar-btn" onClick={() => setAppLogs([])}>
+              Clear Logs
+            </button>
+          </div>
+        </div>
+        {showLogs ? (
+          appLogs.length > 0 ? (
+            <div className="logs-console" role="log" aria-live="polite">
+              {appLogs.map((entry) => (
+                <p key={entry.id} className={`log-line ${entry.level === 'error' ? 'error' : 'info'}`}>
+                  [{entry.timestamp}] [{entry.level.toUpperCase()}] {entry.message}
+                </p>
+              ))}
+            </div>
+          ) : (
+            <p className="subtle">No log entries yet.</p>
+          )
+        ) : (
+          <p className="subtle">Logs are hidden. Click Show Logs to view app activity.</p>
+        )}
+      </section>
     </main>
   )
 }
