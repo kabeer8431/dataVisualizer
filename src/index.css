@@ -224,6 +224,15 @@ body {
   color: var(--text);
 }
 
+.form-grid input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.45rem;
+  background: white;
+  color: var(--text);
+}
+
 .form-grid fieldset {
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -263,6 +272,11 @@ body {
 
 .chart-card {
   margin-top: 0.2rem;
+}
+
+.pivot-actions {
+  margin-top: 0.5rem;
+  margin-bottom: 0.2rem;
 }
 
 .sunburst-toolbar {
@@ -323,6 +337,43 @@ body {
   border-radius: 10px;
   padding: 0.5rem;
   background: #fdfefe;
+}
+
+.pivot-preview {
+  margin-top: 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.7rem;
+  background: #ffffff;
+}
+
+.pivot-preview h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.pivot-preview-scroll {
+  margin-top: 0.55rem;
+  overflow: auto;
+}
+
+.pivot-preview table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 520px;
+}
+
+.pivot-preview th,
+.pivot-preview td {
+  border: 1px solid #d9e1ed;
+  padding: 0.35rem 0.45rem;
+  text-align: left;
+  font-size: 0.84rem;
+}
+
+.pivot-preview th {
+  background: #f4f8ff;
+  font-weight: 700;
 }
 
 button,

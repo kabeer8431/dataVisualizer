@@ -53,6 +53,19 @@ type SheetDataState = {
   selectedSheet: string
 }
 
+type PivotAggregation = 'sum' | 'count' | 'countDistinct' | 'avg' | 'min' | 'max'
+
+type PivotSortOrder = 'none' | 'desc' | 'asc'
+
+type PivotAccumulator = {
+  rows: number
+  numericCount: number
+  sum: number
+  min: number
+  max: number
+  distinctValues: Set<string>
+}
+
 const MAX_ROWS = 25000
 const COLORS = ['#126782', '#f29559', '#457b9d', '#2a9d8f', '#b56576', '#ff7f51']
 
@@ -224,6 +237,73 @@ function getSunburstFill(depth: number, index: number): string {
   return `hsl(${hue}, ${saturation}%, ${lightness}%)`
 }
 
+function pickDefaultValueColumn(headers: string[], dataRows: DataRow[]): string {
+  const firstNumeric = headers.find((header) =>
+    dataRows.some((row) => toNumber(row[header]) !== null),
+  )
+
+  if (firstNumeric) {
+    return firstNumeric
+  }
+
+  return headers[0] ?? ''
+}
+
+function createPivotAccumulator(): PivotAccumulator {
+  return {
+    rows: 0,
+    numericCount: 0,
+    sum: 0,
+    min: Number.POSITIVE_INFINITY,
+    max: Number.NEGATIVE_INFINITY,
+    distinctValues: new Set<string>(),
+  }
+}
+
+function resolvePivotValue(accumulator: PivotAccumulator, aggregation: PivotAggregation): number {
+  if (aggregation === 'count') {
+    return accumulator.rows
+  }
+
+  if (aggregation === 'countDistinct') {
+    return accumulator.distinctValues.size
+  }
+
+  if (aggregation === 'sum') {
+    return accumulator.sum
+  }
+
+  if (aggregation === 'avg') {
+    return accumulator.numericCount > 0 ? accumulator.sum / accumulator.numericCount : 0
+  }
+
+  if (aggregation === 'min') {
+    return accumulator.numericCount > 0 ? accumulator.min : 0
+  }
+
+  return accumulator.numericCount > 0 ? accumulator.max : 0
+}
+
+function shouldFallbackToCount(
+  rows: DataRow[],
+  pivotValueColumn: string,
+  pivotAggregation: PivotAggregation,
+): boolean {
+  if (pivotAggregation === 'count' || pivotAggregation === 'countDistinct') {
+    return false
+  }
+
+  return !rows.some((row) => toNumber(row[pivotValueColumn]) !== null)
+}
+
+function csvEscape(value: string | number): string {
+  const text = String(value)
+  if (text.includes(',') || text.includes('"') || text.includes('\n')) {
+    return `"${text.replaceAll('"', '""')}"`
+  }
+  return text
+}
+
 function aggregateRowValue(row: DataRow, measureColumn?: string): number {
   if (!measureColumn) {
     return 1
@@ -327,8 +407,14 @@ function App() {
   const [columns, setColumns] = useState<string[]>([])
   const [rows, setRows] = useState<DataRow[]>([])
   const [selectedColumns, setSelectedColumns] = useState<string[]>([])
-  const [xColumn, setXColumn] = useState('')
-  const [yColumns, setYColumns] = useState<string[]>([])
+  const [pivotRowColumn, setPivotRowColumn] = useState('')
+  const [pivotSeriesColumn, setPivotSeriesColumn] = useState('')
+  const [pivotValueColumn, setPivotValueColumn] = useState('')
+  const [pivotAggregation, setPivotAggregation] = useState<PivotAggregation>('sum')
+  const [pivotSortOrder, setPivotSortOrder] = useState<PivotSortOrder>('desc')
+  const [pivotTopN, setPivotTopN] = useState(20)
+  const [filterColumn, setFilterColumn] = useState('')
+  const [filterQuery, setFilterQuery] = useState('')
   const [chartType, setChartType] = useState<ChartType>('bar')
   const [renderChart, setRenderChart] = useState(false)
   const [error, setError] = useState('')
@@ -394,8 +480,14 @@ function App() {
       setColumns(parsedData.headers)
       setRows(parsedData.dataRows)
       setSelectedColumns(parsedData.headers)
-      setXColumn(parsedData.headers[0] ?? '')
-      setYColumns(parsedData.headers.slice(1, 3))
+      setPivotRowColumn(parsedData.headers[0] ?? '')
+      setPivotSeriesColumn('')
+      setPivotValueColumn(pickDefaultValueColumn(parsedData.headers, parsedData.dataRows))
+      setPivotAggregation('count')
+      setPivotSortOrder('desc')
+      setPivotTopN(20)
+      setFilterColumn(parsedData.headers[0] ?? '')
+      setFilterQuery('')
       setNotice(parsedData.notice ?? '')
     } catch (parseError) {
       if (parseError instanceof Error) {
@@ -419,8 +511,14 @@ function App() {
       setColumns(parsedData.headers)
       setRows(parsedData.dataRows)
       setSelectedColumns(parsedData.headers)
-      setXColumn(parsedData.headers[0] ?? '')
-      setYColumns(parsedData.headers.slice(1, 3))
+      setPivotRowColumn(parsedData.headers[0] ?? '')
+      setPivotSeriesColumn('')
+      setPivotValueColumn(pickDefaultValueColumn(parsedData.headers, parsedData.dataRows))
+      setPivotAggregation('count')
+      setPivotSortOrder('desc')
+      setPivotTopN(20)
+      setFilterColumn(parsedData.headers[0] ?? '')
+      setFilterQuery('')
       setNotice(parsedData.notice ?? '')
       setError('')
       setRenderChart(false)
@@ -461,44 +559,121 @@ function App() {
     })
   }
 
-  const chartData = useMemo(() => {
-    if (!renderChart || rows.length === 0 || !xColumn) {
-      return []
+  const pivotModel = useMemo(() => {
+    if (!renderChart || chartType === 'sunburst' || rows.length === 0 || !pivotRowColumn) {
+      return {
+        chartData: [] as Record<string, string | number>[],
+        pieData: [] as Array<{ name: string; value: number }>,
+        seriesKeys: [] as string[],
+        filteredRowCount: 0,
+      }
     }
 
-    if (chartType === 'pie') {
-      const targetY = yColumns[0]
-      if (!targetY) {
-        return []
+    const normalizedFilter = filterQuery.trim().toLowerCase()
+    const filteredRows =
+      normalizedFilter.length > 0 && filterColumn
+        ? rows.filter((row) =>
+            String(row[filterColumn] ?? '')
+              .toLowerCase()
+              .includes(normalizedFilter),
+          )
+        : rows
+
+    const rowMap = new Map<string, Map<string, PivotAccumulator>>()
+    const seriesOrdered: string[] = []
+    const effectiveAggregation = shouldFallbackToCount(
+      filteredRows,
+      pivotValueColumn,
+      pivotAggregation,
+    )
+      ? 'count'
+      : pivotAggregation
+
+    filteredRows.forEach((row) => {
+      const rowKey = String(row[pivotRowColumn] ?? 'Unknown')
+      const seriesKey = pivotSeriesColumn ? String(row[pivotSeriesColumn] ?? 'Unknown') : 'Value'
+
+      if (!seriesOrdered.includes(seriesKey)) {
+        seriesOrdered.push(seriesKey)
       }
 
-      const aggregated = new Map<string, number>()
-      rows.forEach((row) => {
-        const category = String(row[xColumn] ?? 'Unknown')
-        const amount = toNumber(row[targetY])
-        if (amount === null) {
-          return
+      let rowBucket = rowMap.get(rowKey)
+      if (!rowBucket) {
+        rowBucket = new Map<string, PivotAccumulator>()
+        rowMap.set(rowKey, rowBucket)
+      }
+
+      let cellAccumulator = rowBucket.get(seriesKey)
+      if (!cellAccumulator) {
+        cellAccumulator = createPivotAccumulator()
+        rowBucket.set(seriesKey, cellAccumulator)
+      }
+
+      cellAccumulator.rows += 1
+      cellAccumulator.distinctValues.add(String(row[pivotValueColumn] ?? ''))
+      const numericValue = toNumber(row[pivotValueColumn])
+      if (numericValue !== null) {
+        cellAccumulator.numericCount += 1
+        cellAccumulator.sum += numericValue
+        if (numericValue < cellAccumulator.min) {
+          cellAccumulator.min = numericValue
         }
-        aggregated.set(category, (aggregated.get(category) ?? 0) + amount)
+        if (numericValue > cellAccumulator.max) {
+          cellAccumulator.max = numericValue
+        }
+      }
+    })
+
+    let chartData = Array.from(rowMap.entries()).map(([rowKey, seriesMap]) => {
+      const next: Record<string, string | number> = { xLabel: rowKey }
+      let rowTotal = 0
+
+      seriesOrdered.forEach((seriesKey) => {
+        const accumulator = seriesMap.get(seriesKey)
+        const value = accumulator ? resolvePivotValue(accumulator, effectiveAggregation) : 0
+        next[seriesKey] = value
+        rowTotal += value
       })
 
-      return Array.from(aggregated.entries()).map(([name, value]) => ({ name, value }))
+      next.total = rowTotal
+      return next
+    })
+
+    if (pivotSortOrder !== 'none') {
+      chartData = [...chartData].sort((left, right) => {
+        const diff = Number(right.total ?? 0) - Number(left.total ?? 0)
+        return pivotSortOrder === 'desc' ? diff : -diff
+      })
     }
 
-    return rows
-      .map((row) => {
-        const next: Record<string, string | number | null> = {
-          xLabel: row[xColumn] == null ? '' : String(row[xColumn]),
-        }
+    if (pivotTopN > 0) {
+      chartData = chartData.slice(0, pivotTopN)
+    }
 
-        yColumns.forEach((column) => {
-          next[column] = toNumber(row[column])
-        })
+    const pieData = chartData.map((entry) => ({
+      name: String(entry.xLabel),
+      value: Number(entry.total ?? 0),
+    }))
 
-        return next
-      })
-      .filter((row) => yColumns.some((column) => typeof row[column] === 'number'))
-  }, [chartType, renderChart, rows, xColumn, yColumns])
+    return {
+      chartData,
+      pieData,
+      seriesKeys: seriesOrdered,
+      filteredRowCount: filteredRows.length,
+    }
+  }, [
+    chartType,
+    filterColumn,
+    filterQuery,
+    pivotAggregation,
+    pivotRowColumn,
+    pivotSeriesColumn,
+    pivotSortOrder,
+    pivotTopN,
+    pivotValueColumn,
+    renderChart,
+    rows,
+  ])
 
   const sunburstData = useMemo(() => {
     if (!renderChart || chartType !== 'sunburst' || rows.length === 0) {
@@ -506,12 +681,12 @@ function App() {
     }
 
     const hierarchyColumns = selectedColumns.slice(0, 4)
-    const numericMeasure = yColumns.find((column) =>
-      rows.some((row) => toNumber(row[column]) !== null),
-    )
+    const numericMeasure = rows.some((row) => toNumber(row[pivotValueColumn]) !== null)
+      ? pivotValueColumn
+      : undefined
 
     return buildSunburstHierarchy(rows, hierarchyColumns, numericMeasure)
-  }, [chartType, renderChart, rows, selectedColumns, yColumns])
+  }, [chartType, pivotValueColumn, renderChart, rows, selectedColumns])
 
   useEffect(() => {
     if (!renderChart || chartType !== 'sunburst' || !sunburstData) {
@@ -562,18 +737,47 @@ function App() {
       return
     }
 
-    if (chartType !== 'sunburst' && !xColumn) {
-      setError('Please choose an X-axis column.')
+    if (chartType !== 'sunburst' && !pivotRowColumn) {
+      setError('Please choose a Rows field for pivot output.')
       return
     }
 
-    if (chartType !== 'sunburst' && yColumns.length === 0) {
-      setError('Please choose at least one Y-axis/value column.')
+    if (chartType !== 'sunburst' && !pivotValueColumn) {
+      setError('Please choose a Values field for pivot output.')
       return
     }
 
     setError('')
     setRenderChart(true)
+  }
+
+  const downloadPivotCsv = () => {
+    if (pivotModel.chartData.length === 0) {
+      setError('No pivot rows available to export.')
+      return
+    }
+
+    const headers = ['Row', ...pivotModel.seriesKeys, 'Total']
+    const lines = [headers.map((item) => csvEscape(item)).join(',')]
+
+    pivotModel.chartData.forEach((entry) => {
+      const rowValues = [
+        csvEscape(String(entry.xLabel ?? '')),
+        ...pivotModel.seriesKeys.map((seriesKey) => csvEscape(Number(entry[seriesKey] ?? 0))),
+        csvEscape(Number(entry.total ?? 0)),
+      ]
+      lines.push(rowValues.join(','))
+    })
+
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${fileName.replace(/\.[^.]+$/, '') || 'pivot'}-pivot.csv`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
   }
 
   return (
@@ -671,11 +875,11 @@ function App() {
               </label>
 
               <label>
-                X-axis / Category
+                Pivot Rows
                 <select
-                  value={xColumn}
+                  value={pivotRowColumn}
                   onChange={(event) => {
-                    setXColumn(event.target.value)
+                    setPivotRowColumn(event.target.value)
                     setRenderChart(false)
                   }}
                 >
@@ -687,30 +891,117 @@ function App() {
                 </select>
               </label>
 
-              <fieldset>
-                <legend>Y-axis / Value Columns</legend>
-                <div className="checkbox-grid">
-                  {selectedColumns
-                    .filter((column) => column !== xColumn)
-                    .map((column) => (
-                      <label key={column} className="checkbox-item">
-                        <input
-                          type="checkbox"
-                          checked={yColumns.includes(column)}
-                          onChange={() => {
-                            setRenderChart(false)
-                            setYColumns((previous) =>
-                              previous.includes(column)
-                                ? previous.filter((item) => item !== column)
-                                : [...previous, column],
-                            )
-                          }}
-                        />
-                        {column}
-                      </label>
-                    ))}
-                </div>
-              </fieldset>
+              <label>
+                Pivot Columns (Series)
+                <select
+                  value={pivotSeriesColumn}
+                  onChange={(event) => {
+                    setPivotSeriesColumn(event.target.value)
+                    setRenderChart(false)
+                  }}
+                >
+                  <option value="">(None)</option>
+                  {selectedColumns.map((column) => (
+                    <option key={column} value={column}>
+                      {column}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Pivot Values
+                <select
+                  value={pivotValueColumn}
+                  onChange={(event) => {
+                    setPivotValueColumn(event.target.value)
+                    setRenderChart(false)
+                  }}
+                >
+                  {selectedColumns.map((column) => (
+                    <option key={column} value={column}>
+                      {column}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Aggregation
+                <select
+                  value={pivotAggregation}
+                  onChange={(event) => {
+                    setPivotAggregation(event.target.value as PivotAggregation)
+                    setRenderChart(false)
+                  }}
+                >
+                  <option value="sum">Sum</option>
+                  <option value="count">Count</option>
+                  <option value="countDistinct">Count Distinct</option>
+                  <option value="avg">Average</option>
+                  <option value="min">Minimum</option>
+                  <option value="max">Maximum</option>
+                </select>
+              </label>
+
+              <label>
+                Filter Field
+                <select
+                  value={filterColumn}
+                  onChange={(event) => {
+                    setFilterColumn(event.target.value)
+                    setRenderChart(false)
+                  }}
+                >
+                  {selectedColumns.map((column) => (
+                    <option key={column} value={column}>
+                      {column}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Filter Contains
+                <input
+                  type="text"
+                  value={filterQuery}
+                  placeholder="e.g. india"
+                  onChange={(event) => {
+                    setFilterQuery(event.target.value)
+                    setRenderChart(false)
+                  }}
+                />
+              </label>
+
+              <label>
+                Sort Rows by Total
+                <select
+                  value={pivotSortOrder}
+                  onChange={(event) => {
+                    setPivotSortOrder(event.target.value as PivotSortOrder)
+                    setRenderChart(false)
+                  }}
+                >
+                  <option value="desc">High to Low</option>
+                  <option value="asc">Low to High</option>
+                  <option value="none">Original</option>
+                </select>
+              </label>
+
+              <label>
+                Top N Rows (0 = all)
+                <input
+                  type="number"
+                  min={0}
+                  value={pivotTopN}
+                  onChange={(event) => {
+                    const parsed = Number(event.target.value)
+                    setPivotTopN(Number.isFinite(parsed) && parsed >= 0 ? parsed : 0)
+                    setRenderChart(false)
+                  }}
+                />
+              </label>
 
               <button type="button" className="submit-btn" onClick={submitConfiguration}>
                 Render Interactive Chart
@@ -718,6 +1009,19 @@ function App() {
               {chartType === 'sunburst' && (
                 <p className="subtle">
                   Sunburst uses your arranged columns as hierarchy (up to first 4 levels).
+                </p>
+              )}
+              {chartType !== 'sunburst' && (
+                <p className="subtle">
+                  Pivot chart uses Rows as category axis, Columns as series, Values as measure,
+                  and Aggregation to summarize records. For text-only value fields, non-count
+                  aggregations automatically fall back to Count.
+                </p>
+              )}
+              {chartType !== 'sunburst' && (
+                <p className="subtle">
+                  Filtered records: {pivotModel.filteredRowCount.toLocaleString()} /{' '}
+                  {rows.length.toLocaleString()}
                 </p>
               )}
             </div>
@@ -728,6 +1032,13 @@ function App() {
       {renderChart && (
         <section className="card chart-card">
           <h2>Interactive Chart</h2>
+          {chartType !== 'sunburst' && (
+            <div className="pivot-actions">
+              <button type="button" className="toolbar-btn" onClick={downloadPivotCsv}>
+                Export Pivot CSV
+              </button>
+            </div>
+          )}
           {chartType === 'sunburst' && currentSunburstNode && (
             <div className="sunburst-toolbar">
               <button
@@ -783,26 +1094,32 @@ function App() {
           <div className="chart-wrap">
             <ResponsiveContainer width="100%" height="100%">
               {chartType === 'bar' ? (
-                <BarChart data={chartData} margin={{ top: 16, right: 20, bottom: 24, left: 8 }}>
+                <BarChart
+                  data={pivotModel.chartData}
+                  margin={{ top: 16, right: 20, bottom: 24, left: 8 }}
+                >
                   <CartesianGrid strokeDasharray="4 4" />
                   <XAxis dataKey="xLabel" angle={-18} textAnchor="end" interval={0} height={70} />
                   <YAxis />
                   <Tooltip />
                   <Legend />
-                  {yColumns.map((col, index) => (
+                  {pivotModel.seriesKeys.map((col, index) => (
                     <Bar key={col} dataKey={col} fill={COLORS[index % COLORS.length]} />
                   ))}
                 </BarChart>
               ) : null}
 
               {chartType === 'line' ? (
-                <LineChart data={chartData} margin={{ top: 16, right: 20, bottom: 24, left: 8 }}>
+                <LineChart
+                  data={pivotModel.chartData}
+                  margin={{ top: 16, right: 20, bottom: 24, left: 8 }}
+                >
                   <CartesianGrid strokeDasharray="4 4" />
                   <XAxis dataKey="xLabel" angle={-18} textAnchor="end" interval={0} height={70} />
                   <YAxis />
                   <Tooltip />
                   <Legend />
-                  {yColumns.map((col, index) => (
+                  {pivotModel.seriesKeys.map((col, index) => (
                     <Line
                       key={col}
                       dataKey={col}
@@ -816,13 +1133,16 @@ function App() {
               ) : null}
 
               {chartType === 'area' ? (
-                <AreaChart data={chartData} margin={{ top: 16, right: 20, bottom: 24, left: 8 }}>
+                <AreaChart
+                  data={pivotModel.chartData}
+                  margin={{ top: 16, right: 20, bottom: 24, left: 8 }}
+                >
                   <CartesianGrid strokeDasharray="4 4" />
                   <XAxis dataKey="xLabel" angle={-18} textAnchor="end" interval={0} height={70} />
                   <YAxis />
                   <Tooltip />
                   <Legend />
-                  {yColumns.map((col, index) => (
+                  {pivotModel.seriesKeys.map((col, index) => (
                     <Area
                       key={col}
                       dataKey={col}
@@ -838,11 +1158,18 @@ function App() {
               {chartType === 'scatter' ? (
                 <ScatterChart margin={{ top: 16, right: 20, bottom: 24, left: 8 }}>
                   <CartesianGrid strokeDasharray="4 4" />
-                  <XAxis dataKey="xLabel" name={xColumn} />
-                  <YAxis dataKey={yColumns[0]} name={yColumns[0]} />
+                  <XAxis dataKey="xLabel" name={pivotRowColumn} type="category" />
+                  <YAxis
+                    dataKey={pivotModel.seriesKeys[0]}
+                    name={pivotModel.seriesKeys[0] ?? 'Value'}
+                  />
                   <Tooltip cursor={{ strokeDasharray: '3 3' }} />
                   <Legend />
-                  <Scatter data={chartData} fill={COLORS[0]} name={yColumns[0]} />
+                  <Scatter
+                    data={pivotModel.chartData}
+                    fill={COLORS[0]}
+                    name={pivotModel.seriesKeys[0] ?? 'Value'}
+                  />
                 </ScatterChart>
               ) : null}
 
@@ -851,14 +1178,14 @@ function App() {
                   <Tooltip />
                   <Legend />
                   <Pie
-                    data={chartData}
+                    data={pivotModel.pieData}
                     dataKey="value"
                     nameKey="name"
                     outerRadius={140}
                     innerRadius={50}
                     label
                   >
-                    {chartData.map((entry, index) => (
+                    {pivotModel.pieData.map((entry, index) => (
                       <Cell
                         key={`${String(entry.name)}-${index}`}
                         fill={COLORS[index % COLORS.length]}
@@ -885,6 +1212,42 @@ function App() {
               ) : null}
             </ResponsiveContainer>
           </div>
+          {chartType !== 'sunburst' && pivotModel.chartData.length > 0 && (
+            <div className="pivot-preview">
+              <h3>Pivot Data Preview</h3>
+              <div className="pivot-preview-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Row</th>
+                      {pivotModel.seriesKeys.map((series) => (
+                        <th key={`head-${series}`}>{series}</th>
+                      ))}
+                      <th>Total</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pivotModel.chartData.slice(0, 30).map((entry) => (
+                      <tr key={`row-${String(entry.xLabel)}`}>
+                        <td>{String(entry.xLabel)}</td>
+                        {pivotModel.seriesKeys.map((series) => (
+                          <td key={`cell-${String(entry.xLabel)}-${series}`}>
+                            {Number(entry[series] ?? 0).toLocaleString()}
+                          </td>
+                        ))}
+                        <td>{Number(entry.total ?? 0).toLocaleString()}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {pivotModel.chartData.length > 30 && (
+                <p className="subtle">
+                  Showing first 30 rows out of {pivotModel.chartData.length.toLocaleString()}.
+                </p>
+              )}
+            </div>
+          )}
         </section>
       )}
     </main>
