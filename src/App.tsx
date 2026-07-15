@@ -12,31 +12,14 @@ import {
   arrayMove,
   sortableKeyboardCoordinates,
 } from '@dnd-kit/sortable'
-import {
-  Area,
-  AreaChart,
-  Bar,
-  BarChart,
-  CartesianGrid,
-  Cell,
-  Legend,
-  Line,
-  LineChart,
-  Pie,
-  PieChart,
-  ResponsiveContainer,
-  Scatter,
-  ScatterChart,
-  SunburstChart,
-  Tooltip,
-  XAxis,
-  YAxis,
-  type SunburstData,
-} from 'recharts'
+import { type SunburstData } from 'recharts'
 import initSqlJs from 'sql.js'
 import type { Database, QueryExecResult, SqlJsStatic } from 'sql.js'
+import ChartDisplayCard from './components/ChartDisplayCard.tsx'
 import ColumnsPanel from './components/ColumnsPanel'
 import LogsCard from './components/LogsCard'
+import QueryPanel from './components/QueryPanel'
+import SunburstFieldsPanel from './components/SunburstFieldsPanel'
 import UploadCard from './components/UploadCard'
 
 type ChartType = 'bar' | 'line' | 'area' | 'scatter' | 'pie' | 'sunburst'
@@ -142,6 +125,9 @@ const SQLITE_IDB_PERSISTENCE_NOTICE =
   'Browser localStorage quota reached. SQLite DB is sharded into IndexedDB and will reload automatically.'
 const SQLITE_PERSISTENCE_WARNING =
   'Browser storage quota reached. Full data is loaded and usable in this session, but persistent SQLite storage is unavailable.'
+const MAX_RENDER_SERIES_POINTS = 1200
+const MAX_RENDER_SCATTER_POINTS = 2500
+const MAX_RENDER_PIE_SLICES = 80
 
 const WIZARD_TEMPLATES: WizardTemplate[] = [
   {
@@ -449,6 +435,70 @@ function csvEscape(value: string | number): string {
   return text
 }
 
+function evenlySample<T>(items: T[], maxItems: number): T[] {
+  if (items.length <= maxItems || maxItems <= 0) {
+    return items
+  }
+
+  if (maxItems === 1) {
+    return [items[0]]
+  }
+
+  const sampled: T[] = []
+  const maxIndex = items.length - 1
+  const step = maxIndex / (maxItems - 1)
+
+  for (let i = 0; i < maxItems; i += 1) {
+    const index = Math.round(i * step)
+    sampled.push(items[Math.min(index, maxIndex)])
+  }
+
+  return sampled
+}
+
+function optimizeChartModelForRender(
+  chartType: ChartType,
+  model: ChartModel,
+): { model: ChartModel; notice: string } {
+  if (chartType === 'pie') {
+    if (model.pieData.length <= MAX_RENDER_PIE_SLICES) {
+      return { model, notice: '' }
+    }
+
+    const sorted = [...model.pieData].sort((left, right) => right.value - left.value)
+    const keepCount = Math.max(1, MAX_RENDER_PIE_SLICES - 1)
+    const kept = sorted.slice(0, keepCount)
+    const others = sorted.slice(keepCount)
+    const othersTotal = others.reduce((sum, entry) => sum + entry.value, 0)
+
+    return {
+      model: {
+        ...model,
+        pieData: [...kept, { name: 'Others', value: othersTotal }],
+      },
+      notice: `Rendering top ${keepCount.toLocaleString()} slices and grouping ${others.length.toLocaleString()} smaller slices as Others for speed.`,
+    }
+  }
+
+  if (chartType !== 'bar' && chartType !== 'line' && chartType !== 'area' && chartType !== 'scatter') {
+    return { model, notice: '' }
+  }
+
+  const maxPoints = chartType === 'scatter' ? MAX_RENDER_SCATTER_POINTS : MAX_RENDER_SERIES_POINTS
+  if (model.chartData.length <= maxPoints) {
+    return { model, notice: '' }
+  }
+
+  const sampled = evenlySample(model.chartData, maxPoints)
+  return {
+    model: {
+      ...model,
+      chartData: sampled,
+    },
+    notice: `Rendering ${maxPoints.toLocaleString()} sampled points from ${model.chartData.length.toLocaleString()} rows for smoother interaction.`,
+  }
+}
+
 function isQuotaExceededError(error: unknown): boolean {
   return (
     error instanceof DOMException &&
@@ -654,25 +704,32 @@ function rebuildSourceTable(db: Database, sourceRows: DataRow[], headers: string
     `INSERT INTO ${SQL_TABLE_SOURCE} (${insertColumns}) VALUES (${placeholders})`,
   )
 
-  sourceRows.forEach((row) => {
-    const values = headers.map((header, index) => {
-      const raw = row[header]
-      if (raw == null) {
-        return null
-      }
+  db.run('BEGIN TRANSACTION')
+  try {
+    sourceRows.forEach((row) => {
+      const values = headers.map((header, index) => {
+        const raw = row[header]
+        if (raw == null) {
+          return null
+        }
 
-      if (numericFlags[index]) {
-        const parsed = toNumber(raw)
-        return parsed ?? null
-      }
+        if (numericFlags[index]) {
+          const parsed = toNumber(raw)
+          return parsed ?? null
+        }
 
-      return String(raw)
+        return String(raw)
+      })
+
+      stmt.run(values)
     })
-
-    stmt.run(values)
-  })
-
-  stmt.free()
+    db.run('COMMIT')
+  } catch (error) {
+    db.run('ROLLBACK')
+    throw error
+  } finally {
+    stmt.free()
+  }
 }
 
 function aggregateRowValue(row: DataRow, measureColumn?: string): number {
@@ -1294,25 +1351,30 @@ function App() {
     sunburstHierarchyColumns,
   ])
 
-  const activeChartModel: ChartModel =
-    dataSourceMode === 'query'
-      ? {
-          chartData: queryRows,
-          pieData: queryRows.map((row, index) => {
-            const label =
-              String(row.name ?? row.label ?? row.category ?? row.xLabel ?? `Row ${index + 1}`)
-            const numericValueColumn = queryColumns.find((column) =>
-              queryRows.some((candidate) => typeof candidate[column] === 'number'),
-            )
-            const value = numericValueColumn ? Number(row[numericValueColumn] ?? 0) : 0
-            return { name: label, value }
-          }),
-          seriesKeys: queryColumns.filter(
-            (column) => column !== 'xLabel' && queryRows.some((row) => typeof row[column] === 'number'),
-          ),
-          filteredRowCount: queryRows.length,
-        }
-      : pivotModel
+  const queryChartModel = useMemo<ChartModel>(() => {
+    const seriesKeys = queryColumns.filter(
+      (column) => column !== 'xLabel' && queryRows.some((row) => typeof row[column] === 'number'),
+    )
+    const numericValueColumn = seriesKeys[0]
+
+    return {
+      chartData: queryRows,
+      pieData: queryRows.map((row, index) => {
+        const label = String(row.name ?? row.label ?? row.category ?? row.xLabel ?? `Row ${index + 1}`)
+        const value = numericValueColumn ? Number(row[numericValueColumn] ?? 0) : 0
+        return { name: label, value }
+      }),
+      seriesKeys,
+      filteredRowCount: queryRows.length,
+    }
+  }, [queryColumns, queryRows])
+
+  const activeChartModel: ChartModel = dataSourceMode === 'query' ? queryChartModel : pivotModel
+
+  const optimizedRenderChart = useMemo(
+    () => optimizeChartModelForRender(chartType, activeChartModel),
+    [activeChartModel, chartType],
+  )
 
   useEffect(() => {
     if (!renderChart || chartType !== 'sunburst' || !sunburstData) {
@@ -1999,74 +2061,32 @@ function App() {
               ) : null}
 
               {dataSourceMode === 'query' ? (
-                <div className="query-panel">
-                  <label htmlFor="query-sql">SQL (table: uploaded_data)</label>
-                  <textarea
-                    id="query-sql"
-                    value={querySql}
-                    onChange={(event) => setQuerySql(event.target.value)}
-                    rows={8}
-                    spellCheck={false}
-                  />
-                  <div className="query-panel-actions">
-                    <button type="button" className="submit-btn" onClick={runSqlQuery}>
-                      Run Query and Visualize
-                    </button>
-                    <button
-                      type="button"
-                      className="secondary-btn"
-                      onClick={() => {
-                        setQuerySql(
-                          `SELECT ${quoteSqlIdentifier('Country')} AS category, SUM(${quoteSqlIdentifier('Sales')}) AS value\nFROM ${SQL_TABLE_SOURCE}\nGROUP BY ${quoteSqlIdentifier('Country')}\nORDER BY value DESC`,
-                        )
-                      }}
-                    >
-                      Load Example Query
-                    </button>
-                  </div>
-                  {queryNotice ? <p className="notice">{queryNotice}</p> : null}
-                  {sqlError ? <p className="error">{sqlError}</p> : null}
-                  {!sqliteReady ? (
-                    <p className="subtle">SQLite is still loading. Query mode will activate soon.</p>
-                  ) : null}
-                </div>
+                <QueryPanel
+                  querySql={querySql}
+                  onQuerySqlChange={setQuerySql}
+                  onRunQuery={runSqlQuery}
+                  onLoadExampleQuery={() => {
+                    setQuerySql(
+                      `SELECT ${quoteSqlIdentifier('Country')} AS category, SUM(${quoteSqlIdentifier('Sales')}) AS value\nFROM ${SQL_TABLE_SOURCE}\nGROUP BY ${quoteSqlIdentifier('Country')}\nORDER BY value DESC`,
+                    )
+                  }}
+                  queryNotice={queryNotice}
+                  sqlError={sqlError}
+                  sqliteReady={sqliteReady}
+                />
               ) : null}
 
               {isSunburstChart ? (
-                <div className="sunburst-field-panel">
-                  <div className="compact-field">
-                    <label htmlFor="sunburst-value-field">Value Field</label>
-                    <select
-                      id="sunburst-value-field"
-                      value={pivotValueColumn}
-                      onChange={(event) => {
-                        setPivotValueColumn(event.target.value)
-                      }}
-                    >
-                      {(dataSourceMode === 'query' ? queryColumns : selectedColumns).map((column) => (
-                        <option key={`sunburst-value-${column}`} value={column}>
-                          {column}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <fieldset className="sunburst-levels">
-                    <legend>Hierarchy Fields</legend>
-                    <div className="sunburst-level-grid">
-                      {sunburstSelectableColumns.map((column) => (
-                        <label key={`sunburst-level-${column}`} className="checkbox-item">
-                          <input
-                            type="checkbox"
-                            checked={sunburstHierarchyColumns.includes(column)}
-                            onChange={() => toggleSunburstHierarchyColumn(column)}
-                          />
-                          {column}
-                        </label>
-                      ))}
-                    </div>
-                  </fieldset>
-                </div>
+                <SunburstFieldsPanel
+                  dataSourceMode={dataSourceMode}
+                  queryColumns={queryColumns}
+                  selectedColumns={selectedColumns}
+                  pivotValueColumn={pivotValueColumn}
+                  onPivotValueColumnChange={setPivotValueColumn}
+                  sunburstSelectableColumns={sunburstSelectableColumns}
+                  sunburstHierarchyColumns={sunburstHierarchyColumns}
+                  onToggleSunburstHierarchyColumn={toggleSunburstHierarchyColumn}
+                />
               ) : null}
 
               {dataSourceMode === 'pivot' && !isSunburstChart ? (
@@ -2313,232 +2333,28 @@ function App() {
         </section>
       )}
 
-      {renderChart && (
-        <section className="card chart-card">
-          <h2>Interactive Chart</h2>
-          {chartType !== 'sunburst' && (
-            <div className="pivot-actions">
-              <button type="button" className="toolbar-btn" onClick={downloadPivotCsv}>
-                Export Pivot CSV
-              </button>
-            </div>
-          )}
-          {chartType === 'sunburst' && currentSunburstNode && (
-            <div className="sunburst-toolbar">
-              <button
-                type="button"
-                className="toolbar-btn"
-                onClick={goSunburstBack}
-                disabled={sunburstStack.length <= 1}
-              >
-                Back
-              </button>
-              <button
-                type="button"
-                className="toolbar-btn"
-                onClick={goSunburstHome}
-                disabled={sunburstStack.length <= 1}
-              >
-                Home
-              </button>
-              <p className="breadcrumb">
-                {currentSunburstPath.join(' / ')}
-              </p>
-            </div>
-          )}
-          <div className="chart-wrap" onMouseMove={handleChartMouseMove}>
-            {chartType === 'sunburst' && sunburstHoverNode ? (
-              <div
-                className="sunburst-callout"
-                role="status"
-                aria-live="polite"
-                style={{
-                  left: `${sunburstHoverPosition.x}px`,
-                  top: `${sunburstHoverPosition.y}px`,
-                }}
-              >
-                <p>
-                  <strong>Segment:</strong> {String(sunburstHoverNode.name)}
-                </p>
-                <p>
-                  <strong>Value:</strong> {(sunburstHoverNode.value ?? 0).toLocaleString()}
-                </p>
-                <p>
-                  <strong>Share:</strong>{' '}
-                  {currentSunburstTotal > 0
-                    ? `${(((sunburstHoverNode.value ?? 0) / currentSunburstTotal) * 100).toFixed(2)}%`
-                    : '0.00%'}
-                </p>
-                <p>
-                  <strong>Path:</strong>{' '}
-                  {[...currentSunburstPath, String(sunburstHoverNode.name)].join(' / ')}
-                </p>
-              </div>
-            ) : null}
-            {chartType !== 'sunburst' && activeChartModel.chartData.length === 0 ? (
-              <div className="empty-state">
-                <p>No chart data available for current filters/settings.</p>
-                <p>Try clearing filters, changing aggregation, or increasing Top N.</p>
-              </div>
-            ) : null}
-            <ResponsiveContainer width="100%" height="100%">
-              {chartType === 'bar' ? (
-                <BarChart
-                  data={activeChartModel.chartData}
-                  margin={{ top: 16, right: 20, bottom: 24, left: 8 }}
-                >
-                  <CartesianGrid strokeDasharray="4 4" />
-                  <XAxis dataKey="xLabel" angle={-18} textAnchor="end" interval={0} height={70} />
-                  <YAxis />
-                  <Tooltip />
-                  <Legend />
-                  {activeChartModel.seriesKeys.map((col, index) => (
-                    <Bar key={col} dataKey={col} fill={COLORS[index % COLORS.length]} />
-                  ))}
-                </BarChart>
-              ) : null}
-
-              {chartType === 'line' ? (
-                <LineChart
-                  data={activeChartModel.chartData}
-                  margin={{ top: 16, right: 20, bottom: 24, left: 8 }}
-                >
-                  <CartesianGrid strokeDasharray="4 4" />
-                  <XAxis dataKey="xLabel" angle={-18} textAnchor="end" interval={0} height={70} />
-                  <YAxis />
-                  <Tooltip />
-                  <Legend />
-                  {activeChartModel.seriesKeys.map((col, index) => (
-                    <Line
-                      key={col}
-                      dataKey={col}
-                      stroke={COLORS[index % COLORS.length]}
-                      strokeWidth={2.2}
-                      dot={false}
-                      type="monotone"
-                    />
-                  ))}
-                </LineChart>
-              ) : null}
-
-              {chartType === 'area' ? (
-                <AreaChart
-                  data={activeChartModel.chartData}
-                  margin={{ top: 16, right: 20, bottom: 24, left: 8 }}
-                >
-                  <CartesianGrid strokeDasharray="4 4" />
-                  <XAxis dataKey="xLabel" angle={-18} textAnchor="end" interval={0} height={70} />
-                  <YAxis />
-                  <Tooltip />
-                  <Legend />
-                  {activeChartModel.seriesKeys.map((col, index) => (
-                    <Area
-                      key={col}
-                      dataKey={col}
-                      stroke={COLORS[index % COLORS.length]}
-                      fill={COLORS[index % COLORS.length]}
-                      fillOpacity={0.32}
-                      type="monotone"
-                    />
-                  ))}
-                </AreaChart>
-              ) : null}
-
-              {chartType === 'scatter' ? (
-                <ScatterChart margin={{ top: 16, right: 20, bottom: 24, left: 8 }}>
-                  <CartesianGrid strokeDasharray="4 4" />
-                  <XAxis dataKey="xLabel" name={pivotRowColumn} type="category" />
-                  <YAxis
-                    dataKey={activeChartModel.seriesKeys[0]}
-                    name={activeChartModel.seriesKeys[0] ?? 'Value'}
-                  />
-                  <Tooltip cursor={{ strokeDasharray: '3 3' }} />
-                  <Legend />
-                  <Scatter
-                    data={activeChartModel.chartData}
-                    fill={COLORS[0]}
-                    name={activeChartModel.seriesKeys[0] ?? 'Value'}
-                  />
-                </ScatterChart>
-              ) : null}
-
-              {chartType === 'pie' ? (
-                <PieChart>
-                  <Tooltip />
-                  <Legend />
-                  <Pie
-                    data={activeChartModel.pieData}
-                    dataKey="value"
-                    nameKey="name"
-                    outerRadius={140}
-                    innerRadius={50}
-                    label
-                  >
-                    {activeChartModel.pieData.map((entry, index) => (
-                      <Cell
-                        key={`${String(entry.name)}-${index}`}
-                        fill={COLORS[index % COLORS.length]}
-                      />
-                    ))}
-                  </Pie>
-                </PieChart>
-              ) : null}
-
-              {chartType === 'sunburst' && currentSunburstNode ? (
-                <SunburstChart
-                  data={currentSunburstNode}
-                  dataKey="value"
-                  nameKey="name"
-                  width="100%"
-                  height="100%"
-                  innerRadius={35}
-                  ringPadding={3}
-                  stroke="#ffffff"
-                  onClick={handleSunburstClick}
-                  onMouseEnter={(node) => setSunburstHoverNode(node)}
-                  onMouseLeave={() => setSunburstHoverNode(null)}
-                />
-              ) : null}
-            </ResponsiveContainer>
-          </div>
-          {chartType !== 'sunburst' && activeChartModel.chartData.length > 0 && (
-            <div className="pivot-preview">
-              <h3>Pivot Data Preview</h3>
-              <div className="pivot-preview-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Row</th>
-                      {activeChartModel.seriesKeys.map((series) => (
-                        <th key={`head-${series}`}>{series}</th>
-                      ))}
-                      <th>Total</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {activeChartModel.chartData.slice(0, 30).map((entry) => (
-                      <tr key={`row-${String(entry.xLabel)}`}>
-                        <td>{String(entry.xLabel)}</td>
-                        {activeChartModel.seriesKeys.map((series) => (
-                          <td key={`cell-${String(entry.xLabel)}-${series}`}>
-                            {Number(entry[series] ?? 0).toLocaleString()}
-                          </td>
-                        ))}
-                        <td>{Number(entry.total ?? 0).toLocaleString()}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              {activeChartModel.chartData.length > 30 && (
-                <p className="subtle">
-                  Showing first 30 rows out of {activeChartModel.chartData.length.toLocaleString()}.
-                </p>
-              )}
-            </div>
-          )}
-        </section>
-      )}
+      <ChartDisplayCard
+        renderChart={renderChart}
+        chartType={chartType}
+        colors={COLORS}
+        renderChartModel={optimizedRenderChart.model}
+        sourceChartModel={activeChartModel}
+        renderPerfNotice={optimizedRenderChart.notice}
+        pivotRowColumn={pivotRowColumn}
+        currentSunburstNode={currentSunburstNode}
+        currentSunburstPath={currentSunburstPath}
+        currentSunburstTotal={currentSunburstTotal}
+        sunburstStackLength={sunburstStack.length}
+        sunburstHoverNode={sunburstHoverNode}
+        sunburstHoverPosition={sunburstHoverPosition}
+        onChartMouseMove={handleChartMouseMove}
+        onExportPivotCsv={downloadPivotCsv}
+        onGoSunburstBack={goSunburstBack}
+        onGoSunburstHome={goSunburstHome}
+        onSunburstClick={handleSunburstClick}
+        onSunburstMouseEnter={(node: SunburstData) => setSunburstHoverNode(node)}
+        onSunburstMouseLeave={() => setSunburstHoverNode(null)}
+      />
 
       <LogsCard
         showLogs={showLogs}
