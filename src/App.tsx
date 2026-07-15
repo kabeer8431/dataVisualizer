@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react'
 import * as XLSX from 'xlsx'
 import sqlWasmUrl from 'sql.js/dist/sql-wasm.wasm?url'
 import {
@@ -15,16 +15,17 @@ import {
 import { type SunburstData } from 'recharts'
 import initSqlJs from 'sql.js'
 import type { Database, QueryExecResult, SqlJsStatic } from 'sql.js'
-import ChartDisplayCard from './components/ChartDisplayCard.tsx'
 import ColumnsPanel from './components/ColumnsPanel'
 import LogsCard from './components/LogsCard'
-import QueryPanel from './components/QueryPanel'
-import SunburstFieldsPanel from './components/SunburstFieldsPanel'
 import UploadCard from './components/UploadCard'
 import {
-  DETAILED_CHART_STORAGE_KEY,
   type DetailedChartPayload,
 } from './detailPayload'
+import { saveDetailedPayload } from './detailPayloadStore'
+
+const ChartDisplayCard = lazy(() => import('./components/ChartDisplayCard.tsx'))
+const QueryPanel = lazy(() => import('./components/QueryPanel'))
+const SunburstFieldsPanel = lazy(() => import('./components/SunburstFieldsPanel'))
 
 type ChartType = 'bar' | 'line' | 'area' | 'scatter' | 'pie' | 'sunburst'
 type DataRow = Record<string, unknown>
@@ -1806,7 +1807,7 @@ function App() {
     pushLog('info', `Exported ${activeChartModel.chartData.length.toLocaleString()} rows to CSV.`)
   }
 
-  const openDetailedChartWindow = () => {
+  const openDetailedChartWindow = async () => {
     if (!renderChart) {
       return
     }
@@ -1818,6 +1819,12 @@ function App() {
       chartType,
       dataSourceMode,
       pivotRowColumn,
+      pivotSeriesColumn,
+      pivotValueColumn,
+      pivotAggregation,
+      filterColumn,
+      filterQuery,
+      selectedColumnCount: selectedColumns.length,
       renderPerfNotice: optimizedRenderChart.notice,
       colors: COLORS,
       renderChartModel: optimizedRenderChart.model,
@@ -1828,7 +1835,10 @@ function App() {
     }
 
     try {
-      localStorage.setItem(DETAILED_CHART_STORAGE_KEY, JSON.stringify(payload))
+      const savedTo = await saveDetailedPayload(payload)
+      if (savedTo === 'indexedDB') {
+        setNotice('Detailed payload was stored in IndexedDB for large-size reliability.')
+      }
     } catch {
       setError('Unable to prepare detailed chart view due to browser storage limits.')
       pushLog('error', 'Open detailed window failed: could not store payload.')
@@ -2102,32 +2112,36 @@ function App() {
               ) : null}
 
               {dataSourceMode === 'query' ? (
-                <QueryPanel
-                  querySql={querySql}
-                  onQuerySqlChange={setQuerySql}
-                  onRunQuery={runSqlQuery}
-                  onLoadExampleQuery={() => {
-                    setQuerySql(
-                      `SELECT ${quoteSqlIdentifier('Country')} AS category, SUM(${quoteSqlIdentifier('Sales')}) AS value\nFROM ${SQL_TABLE_SOURCE}\nGROUP BY ${quoteSqlIdentifier('Country')}\nORDER BY value DESC`,
-                    )
-                  }}
-                  queryNotice={queryNotice}
-                  sqlError={sqlError}
-                  sqliteReady={sqliteReady}
-                />
+                <Suspense fallback={<p className="subtle">Loading query panel...</p>}>
+                  <QueryPanel
+                    querySql={querySql}
+                    onQuerySqlChange={setQuerySql}
+                    onRunQuery={runSqlQuery}
+                    onLoadExampleQuery={() => {
+                      setQuerySql(
+                        `SELECT ${quoteSqlIdentifier('Country')} AS category, SUM(${quoteSqlIdentifier('Sales')}) AS value\nFROM ${SQL_TABLE_SOURCE}\nGROUP BY ${quoteSqlIdentifier('Country')}\nORDER BY value DESC`,
+                      )
+                    }}
+                    queryNotice={queryNotice}
+                    sqlError={sqlError}
+                    sqliteReady={sqliteReady}
+                  />
+                </Suspense>
               ) : null}
 
               {isSunburstChart ? (
-                <SunburstFieldsPanel
-                  dataSourceMode={dataSourceMode}
-                  queryColumns={queryColumns}
-                  selectedColumns={selectedColumns}
-                  pivotValueColumn={pivotValueColumn}
-                  onPivotValueColumnChange={setPivotValueColumn}
-                  sunburstSelectableColumns={sunburstSelectableColumns}
-                  sunburstHierarchyColumns={sunburstHierarchyColumns}
-                  onToggleSunburstHierarchyColumn={toggleSunburstHierarchyColumn}
-                />
+                <Suspense fallback={<p className="subtle">Loading sunburst controls...</p>}>
+                  <SunburstFieldsPanel
+                    dataSourceMode={dataSourceMode}
+                    queryColumns={queryColumns}
+                    selectedColumns={selectedColumns}
+                    pivotValueColumn={pivotValueColumn}
+                    onPivotValueColumnChange={setPivotValueColumn}
+                    sunburstSelectableColumns={sunburstSelectableColumns}
+                    sunburstHierarchyColumns={sunburstHierarchyColumns}
+                    onToggleSunburstHierarchyColumn={toggleSunburstHierarchyColumn}
+                  />
+                </Suspense>
               ) : null}
 
               {dataSourceMode === 'pivot' && !isSunburstChart ? (
@@ -2374,29 +2388,31 @@ function App() {
         </section>
       )}
 
-      <ChartDisplayCard
-        renderChart={renderChart}
-        chartType={chartType}
-        colors={COLORS}
-        renderChartModel={optimizedRenderChart.model}
-        sourceChartModel={activeChartModel}
-        renderPerfNotice={optimizedRenderChart.notice}
-        pivotRowColumn={pivotRowColumn}
-        currentSunburstNode={currentSunburstNode}
-        currentSunburstPath={currentSunburstPath}
-        currentSunburstTotal={currentSunburstTotal}
-        sunburstStackLength={sunburstStack.length}
-        sunburstHoverNode={sunburstHoverNode}
-        sunburstHoverPosition={sunburstHoverPosition}
-        onChartMouseMove={handleChartMouseMove}
-        onExportPivotCsv={downloadPivotCsv}
-        onOpenDetailedWindow={openDetailedChartWindow}
-        onGoSunburstBack={goSunburstBack}
-        onGoSunburstHome={goSunburstHome}
-        onSunburstClick={handleSunburstClick}
-        onSunburstMouseEnter={(node: SunburstData) => setSunburstHoverNode(node)}
-        onSunburstMouseLeave={() => setSunburstHoverNode(null)}
-      />
+      <Suspense fallback={<section className="card"><p className="subtle">Loading chart module...</p></section>}>
+        <ChartDisplayCard
+          renderChart={renderChart}
+          chartType={chartType}
+          colors={COLORS}
+          renderChartModel={optimizedRenderChart.model}
+          sourceChartModel={activeChartModel}
+          renderPerfNotice={optimizedRenderChart.notice}
+          pivotRowColumn={pivotRowColumn}
+          currentSunburstNode={currentSunburstNode}
+          currentSunburstPath={currentSunburstPath}
+          currentSunburstTotal={currentSunburstTotal}
+          sunburstStackLength={sunburstStack.length}
+          sunburstHoverNode={sunburstHoverNode}
+          sunburstHoverPosition={sunburstHoverPosition}
+          onChartMouseMove={handleChartMouseMove}
+          onExportPivotCsv={downloadPivotCsv}
+          onOpenDetailedWindow={openDetailedChartWindow}
+          onGoSunburstBack={goSunburstBack}
+          onGoSunburstHome={goSunburstHome}
+          onSunburstClick={handleSunburstClick}
+          onSunburstMouseEnter={(node: SunburstData) => setSunburstHoverNode(node)}
+          onSunburstMouseLeave={() => setSunburstHoverNode(null)}
+        />
+      </Suspense>
 
       <LogsCard
         showLogs={showLogs}

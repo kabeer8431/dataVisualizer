@@ -36,8 +36,9 @@ body {
 }
 
 .app-shell {
-  width: min(1240px, 93vw);
-  margin: 2rem auto 2.5rem;
+  width: 100%;
+  margin: 0;
+  padding: 1.1rem 1.1rem 1.6rem;
   display: grid;
   gap: 0.9rem;
 }
@@ -674,8 +675,9 @@ body {
 }
 
 .detail-shell {
-  width: min(1440px, 96vw);
-  margin: 1rem auto 2rem;
+  width: 100%;
+  margin: 0;
+  padding: 1rem 1rem 1.8rem;
   display: grid;
   gap: 0.8rem;
 }
@@ -730,9 +732,54 @@ body {
   font-size: 1.02rem;
 }
 
+.detail-main-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 0.75rem;
+  align-items: start;
+}
+
+.detail-insights-card {
+  position: sticky;
+  top: 0.7rem;
+}
+
+.detail-section + .detail-section {
+  margin-top: 0.65rem;
+}
+
+.detail-section h3 {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.detail-section ul {
+  margin: 0.35rem 0 0;
+  padding-left: 1rem;
+  display: grid;
+  gap: 0.22rem;
+}
+
+.detail-hover-box {
+  margin-top: 0.4rem;
+  border: 1px solid #d6e2f4;
+  border-radius: 8px;
+  padding: 0.5rem 0.55rem;
+  background: #f7fbff;
+}
+
+.detail-hover-box p {
+  margin: 0;
+  font-size: 0.86rem;
+}
+
+.detail-hover-box p + p {
+  margin-top: 0.24rem;
+}
+
 .detail-chart-wrap {
   width: 100%;
-  height: 620px;
+  height: clamp(360px, 62vh, 760px);
   margin-top: 0.7rem;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -790,6 +837,14 @@ input:focus-visible {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .detail-main-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .detail-insights-card {
+    position: static;
+  }
+
   .detail-chart-wrap {
     height: 500px;
   }
@@ -797,8 +852,8 @@ input:focus-visible {
 
 @media (max-width: 640px) {
   .app-shell {
-    width: 94vw;
-    margin-top: 1rem;
+    width: 100%;
+    padding: 0.7rem 0.6rem 1.1rem;
   }
 
   .hero-panel {
@@ -831,7 +886,8 @@ input:focus-visible {
   }
 
   .detail-shell {
-    width: 94vw;
+    width: 100%;
+    padding: 0.6rem 0.55rem 1rem;
   }
 
   .detail-metrics-grid {

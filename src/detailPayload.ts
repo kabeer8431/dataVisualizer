@@ -16,6 +16,12 @@ export type DetailedChartPayload = {
   chartType: DetailedChartType
   dataSourceMode: 'pivot' | 'query' | 'wizard'
   pivotRowColumn: string
+  pivotSeriesColumn: string
+  pivotValueColumn: string
+  pivotAggregation: 'sum' | 'count' | 'countDistinct' | 'avg' | 'min' | 'max'
+  filterColumn: string
+  filterQuery: string
+  selectedColumnCount: number
   renderPerfNotice: string
   colors: string[]
   renderChartModel: DetailedChartModel
