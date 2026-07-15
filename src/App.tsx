@@ -41,6 +41,11 @@ import {
 
 type ChartType = 'bar' | 'line' | 'area' | 'scatter' | 'pie' | 'sunburst'
 type DataRow = Record<string, unknown>
+type ParsedDataResult = {
+  headers: string[]
+  dataRows: DataRow[]
+  notice?: string
+}
 
 const MAX_ROWS = 25000
 const COLORS = ['#126782', '#f29559', '#457b9d', '#2a9d8f', '#b56576', '#ff7f51']
@@ -70,6 +75,123 @@ function uniqueHeaders(headerRow: unknown[], width: number): string[] {
   }
 
   return headers
+}
+
+function getFileExtension(fileName: string): string {
+  const lastDot = fileName.lastIndexOf('.')
+  if (lastDot === -1) {
+    return ''
+  }
+  return fileName.slice(lastDot + 1).toLowerCase()
+}
+
+function parseMatrixData(matrix: unknown[][]): ParsedDataResult {
+  if (matrix.length === 0) {
+    throw new Error('The selected file is empty.')
+  }
+
+  const width = matrix.reduce((max, current) => Math.max(max, current.length), 0)
+  if (width === 0) {
+    throw new Error('Could not detect any columns in this file.')
+  }
+
+  const headers = uniqueHeaders(matrix[0], width)
+  const dataRows = matrix.slice(1, MAX_ROWS + 1).map((cells) => {
+    const row: DataRow = {}
+    headers.forEach((header, index) => {
+      row[header] = cells[index] ?? null
+    })
+    return row
+  })
+
+  const result: ParsedDataResult = {
+    headers,
+    dataRows,
+  }
+
+  if (matrix.length - 1 > MAX_ROWS) {
+    result.notice = `Loaded first ${MAX_ROWS.toLocaleString()} rows for smooth chart rendering out of ${(matrix.length - 1).toLocaleString()} rows.`
+  }
+
+  return result
+}
+
+function normalizeJsonRecords(parsed: unknown): DataRow[] {
+  const toRows = (value: unknown[]): DataRow[] =>
+    value.map((entry, index) => {
+      if (entry !== null && typeof entry === 'object' && !Array.isArray(entry)) {
+        return entry as DataRow
+      }
+
+      if (Array.isArray(entry)) {
+        const row: DataRow = {}
+        entry.forEach((cell, cellIndex) => {
+          row[`Column_${cellIndex + 1}`] = cell
+        })
+        return row
+      }
+
+      return { value: entry, rowIndex: index + 1 }
+    })
+
+  if (Array.isArray(parsed)) {
+    return toRows(parsed)
+  }
+
+  if (parsed !== null && typeof parsed === 'object') {
+    const objectValue = parsed as Record<string, unknown>
+    const firstArray = Object.values(objectValue).find((value) => Array.isArray(value))
+    if (Array.isArray(firstArray)) {
+      return toRows(firstArray)
+    }
+  }
+
+  throw new Error('JSON must be an array, or an object containing an array field.')
+}
+
+function parseJsonData(text: string): ParsedDataResult {
+  const parsed = JSON.parse(text) as unknown
+  const allRows = normalizeJsonRecords(parsed)
+
+  if (allRows.length === 0) {
+    throw new Error('The JSON file has no rows.')
+  }
+
+  const limitedRows = allRows.slice(0, MAX_ROWS)
+  const headerSeen = new Set<string>()
+  const headers: string[] = []
+
+  limitedRows.forEach((row) => {
+    Object.keys(row).forEach((key) => {
+      if (!headerSeen.has(key)) {
+        headerSeen.add(key)
+        headers.push(key)
+      }
+    })
+  })
+
+  if (headers.length === 0) {
+    throw new Error('Could not detect any fields in the JSON rows.')
+  }
+
+  const dataRows = limitedRows.map((row) => {
+    const normalized: DataRow = {}
+    headers.forEach((header) => {
+      normalized[header] = row[header] ?? null
+    })
+    return normalized
+  })
+
+  const result: ParsedDataResult = {
+    headers,
+    dataRows,
+  }
+
+  if (allRows.length > MAX_ROWS) {
+    result.notice = `Loaded first ${MAX_ROWS.toLocaleString()} rows for smooth chart rendering out of ${allRows.length.toLocaleString()} rows.`
+  }
+
+  return result
 }
 
 function aggregateRowValue(row: DataRow, measureColumn?: string): number {
@@ -199,57 +321,49 @@ function App() {
     }
 
     try {
-      const buffer = await file.arrayBuffer()
-      const workbook = XLSX.read(buffer, { type: 'array', dense: true })
-      const firstSheetName = workbook.SheetNames[0]
+      const extension = getFileExtension(file.name)
+      let parsedData: ParsedDataResult
 
-      if (!firstSheetName) {
-        setError('No sheet found in the uploaded file.')
+      if (extension === 'xlsx' || extension === 'xls' || extension === 'csv') {
+        const workbook =
+          extension === 'csv'
+            ? XLSX.read(await file.text(), { type: 'string', dense: true })
+            : XLSX.read(await file.arrayBuffer(), { type: 'array', dense: true })
+        const firstSheetName = workbook.SheetNames[0]
+
+        if (!firstSheetName) {
+          setError('No sheet found in the uploaded file.')
+          return
+        }
+
+        const sheet = workbook.Sheets[firstSheetName]
+        const matrix = XLSX.utils.sheet_to_json(sheet, {
+          header: 1,
+          raw: true,
+          defval: null,
+          blankrows: false,
+        }) as unknown[][]
+        parsedData = parseMatrixData(matrix)
+      } else if (extension === 'json') {
+        parsedData = parseJsonData(await file.text())
+      } else {
+        setError('Unsupported file type. Upload .xlsx, .xls, .csv, or .json.')
         return
-      }
-
-      const sheet = workbook.Sheets[firstSheetName]
-      const matrix = XLSX.utils.sheet_to_json(sheet, {
-        header: 1,
-        raw: true,
-        defval: null,
-        blankrows: false,
-      }) as unknown[][]
-
-      if (matrix.length === 0) {
-        setError('The selected sheet is empty.')
-        return
-      }
-
-      const width = matrix.reduce((max, current) => Math.max(max, current.length), 0)
-      if (width === 0) {
-        setError('Could not detect any columns in this file.')
-        return
-      }
-
-      const headers = uniqueHeaders(matrix[0], width)
-      const dataRows = matrix.slice(1, MAX_ROWS + 1).map((cells) => {
-        const row: DataRow = {}
-        headers.forEach((header, index) => {
-          row[header] = cells[index] ?? null
-        })
-        return row
-      })
-
-      if (matrix.length - 1 > MAX_ROWS) {
-        setNotice(
-          `Loaded first ${MAX_ROWS.toLocaleString()} rows for smooth chart rendering out of ${(matrix.length - 1).toLocaleString()} rows.`,
-        )
       }
 
       setFileName(file.name)
-      setColumns(headers)
-      setRows(dataRows)
-      setSelectedColumns(headers)
-      setXColumn(headers[0] ?? '')
-      setYColumns(headers.slice(1, 3))
-    } catch {
-      setError('Unable to parse the file. Please upload a valid .xlsx or .xls file.')
+      setColumns(parsedData.headers)
+      setRows(parsedData.dataRows)
+      setSelectedColumns(parsedData.headers)
+      setXColumn(parsedData.headers[0] ?? '')
+      setYColumns(parsedData.headers.slice(1, 3))
+      setNotice(parsedData.notice ?? '')
+    } catch (parseError) {
+      if (parseError instanceof Error) {
+        setError(parseError.message)
+      } else {
+        setError('Unable to parse the file. Please upload a valid .xlsx, .xls, .csv, or .json file.')
+      }
     }
   }
 
@@ -399,12 +513,12 @@ function App() {
 
       <section className="card">
         <label htmlFor="excel-file" className="upload-label">
-          Upload Excel file (.xlsx, .xls)
+          Upload data file (.xlsx, .xls, .csv, .json)
         </label>
         <input
           id="excel-file"
           type="file"
-          accept=".xlsx,.xls"
+          accept=".xlsx,.xls,.csv,.json"
           onChange={handleUpload}
           className="file-input"
         />

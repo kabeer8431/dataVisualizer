@@ -4,7 +4,7 @@ Web UI project to upload an Excel file, list all detected columns, arrange colum
 
 ## Features
 
-- Upload `.xlsx` or `.xls` files
+- Upload `.xlsx`, `.xls`, `.csv`, or `.json` files
 - Detect and list all columns from the first sheet
 - Select/unselect columns and drag to rearrange order
 - Choose chart type: Bar, Line, Area, Scatter, Pie, Sunburst
