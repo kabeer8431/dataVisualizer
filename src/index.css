@@ -110,6 +110,23 @@ body {
   font-size: 0.92rem;
 }
 
+.sheet-select-label {
+  margin-top: 0.65rem;
+  display: grid;
+  gap: 0.35rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.sheet-select-label select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.45rem;
+  background: #fff;
+  color: var(--text);
+}
+
 .notice {
   margin: 0.65rem 0 0;
   color: var(--success);
@@ -278,6 +295,24 @@ body {
   font-size: 0.9rem;
   overflow: auto;
   white-space: nowrap;
+}
+
+.sunburst-hover-panel {
+  margin-top: 0.45rem;
+  border: 1px solid #d2dbe8;
+  border-radius: 9px;
+  background: linear-gradient(180deg, #fcfdff 0%, #f2f7ff 100%);
+  padding: 0.65rem 0.75rem;
+}
+
+.sunburst-hover-panel p {
+  margin: 0;
+  color: #334b67;
+  font-size: 0.9rem;
+}
+
+.sunburst-hover-panel p + p {
+  margin-top: 0.35rem;
 }
 
 .chart-wrap {

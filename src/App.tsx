@@ -47,6 +47,12 @@ type ParsedDataResult = {
   notice?: string
 }
 
+type SheetDataState = {
+  workbook: XLSX.WorkBook | null
+  sheetNames: string[]
+  selectedSheet: string
+}
+
 const MAX_ROWS = 25000
 const COLORS = ['#126782', '#f29559', '#457b9d', '#2a9d8f', '#b56576', '#ff7f51']
 
@@ -194,6 +200,30 @@ function parseJsonData(text: string): ParsedDataResult {
   return result
 }
 
+function parseWorkbookSheet(workbook: XLSX.WorkBook, sheetName: string): ParsedDataResult {
+  const sheet = workbook.Sheets[sheetName]
+
+  if (!sheet) {
+    throw new Error(`Sheet "${sheetName}" was not found in the uploaded file.`)
+  }
+
+  const matrix = XLSX.utils.sheet_to_json(sheet, {
+    header: 1,
+    raw: true,
+    defval: null,
+    blankrows: false,
+  }) as unknown[][]
+
+  return parseMatrixData(matrix)
+}
+
+function getSunburstFill(depth: number, index: number): string {
+  const hue = (depth * 36 + index * 57) % 360
+  const saturation = Math.max(74 - depth * 6, 52)
+  const lightness = Math.min(42 + depth * 7, 57)
+  return `hsl(${hue}, ${saturation}%, ${lightness}%)`
+}
+
 function aggregateRowValue(row: DataRow, measureColumn?: string): number {
   if (!measureColumn) {
     return 1
@@ -240,7 +270,7 @@ function buildSunburstHierarchy(
     return Array.from(groups.entries()).map(([name, groupedRows], index) => {
       const base: SunburstData = {
         name,
-        fill: COLORS[(depth + index) % COLORS.length],
+        fill: getSunburstFill(depth, index),
       }
 
       if (depth < hierarchyColumns.length - 1) {
@@ -304,6 +334,12 @@ function App() {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [sunburstStack, setSunburstStack] = useState<SunburstData[]>([])
+  const [sheetData, setSheetData] = useState<SheetDataState>({
+    workbook: null,
+    sheetNames: [],
+    selectedSheet: '',
+  })
+  const [sunburstHoverNode, setSunburstHoverNode] = useState<SunburstData | null>(null)
 
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -336,16 +372,19 @@ function App() {
           return
         }
 
-        const sheet = workbook.Sheets[firstSheetName]
-        const matrix = XLSX.utils.sheet_to_json(sheet, {
-          header: 1,
-          raw: true,
-          defval: null,
-          blankrows: false,
-        }) as unknown[][]
-        parsedData = parseMatrixData(matrix)
+        parsedData = parseWorkbookSheet(workbook, firstSheetName)
+        setSheetData({
+          workbook,
+          sheetNames: workbook.SheetNames,
+          selectedSheet: firstSheetName,
+        })
       } else if (extension === 'json') {
         parsedData = parseJsonData(await file.text())
+        setSheetData({
+          workbook: null,
+          sheetNames: [],
+          selectedSheet: '',
+        })
       } else {
         setError('Unsupported file type. Upload .xlsx, .xls, .csv, or .json.')
         return
@@ -363,6 +402,34 @@ function App() {
         setError(parseError.message)
       } else {
         setError('Unable to parse the file. Please upload a valid .xlsx, .xls, .csv, or .json file.')
+      }
+    }
+  }
+
+  const handleSheetChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+    const nextSheet = event.target.value
+
+    if (!sheetData.workbook) {
+      return
+    }
+
+    try {
+      const parsedData = parseWorkbookSheet(sheetData.workbook, nextSheet)
+      setSheetData((previous) => ({ ...previous, selectedSheet: nextSheet }))
+      setColumns(parsedData.headers)
+      setRows(parsedData.dataRows)
+      setSelectedColumns(parsedData.headers)
+      setXColumn(parsedData.headers[0] ?? '')
+      setYColumns(parsedData.headers.slice(1, 3))
+      setNotice(parsedData.notice ?? '')
+      setError('')
+      setRenderChart(false)
+      setSunburstHoverNode(null)
+    } catch (parseError) {
+      if (parseError instanceof Error) {
+        setError(parseError.message)
+      } else {
+        setError('Unable to read the selected sheet. Please try another one.')
       }
     }
   }
@@ -449,10 +516,12 @@ function App() {
   useEffect(() => {
     if (!renderChart || chartType !== 'sunburst' || !sunburstData) {
       setSunburstStack([])
+      setSunburstHoverNode(null)
       return
     }
 
     setSunburstStack([sunburstData])
+    setSunburstHoverNode(null)
   }, [chartType, renderChart, sunburstData])
 
   const currentSunburstNode =
@@ -464,11 +533,13 @@ function App() {
     }
 
     setSunburstStack((previous) => [...previous, node])
+    setSunburstHoverNode(null)
   }
 
   const goSunburstHome = () => {
     if (sunburstStack.length > 0) {
       setSunburstStack([sunburstStack[0]])
+      setSunburstHoverNode(null)
     }
   }
 
@@ -479,7 +550,11 @@ function App() {
       }
       return previous.slice(0, -1)
     })
+    setSunburstHoverNode(null)
   }
+
+  const currentSunburstTotal = currentSunburstNode?.value ?? 0
+  const currentSunburstPath = sunburstStack.map((node) => String(node.name))
 
   const submitConfiguration = () => {
     if (chartType === 'sunburst' && selectedColumns.length === 0) {
@@ -524,6 +599,18 @@ function App() {
         />
 
         {fileName && <p className="meta">Loaded file: {fileName}</p>}
+        {sheetData.sheetNames.length > 0 && (
+          <label className="sheet-select-label">
+            Select sheet
+            <select value={sheetData.selectedSheet} onChange={handleSheetChange}>
+              {sheetData.sheetNames.map((sheetName) => (
+                <option key={sheetName} value={sheetName}>
+                  {sheetName}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         {notice && <p className="notice">{notice}</p>}
         {error && <p className="error">{error}</p>}
       </section>
@@ -660,8 +747,37 @@ function App() {
                 Home
               </button>
               <p className="breadcrumb">
-                {sunburstStack.map((node) => String(node.name)).join(' / ')}
+                {currentSunburstPath.join(' / ')}
               </p>
+            </div>
+          )}
+          {chartType === 'sunburst' && currentSunburstNode && (
+            <div className="sunburst-hover-panel" role="status" aria-live="polite">
+              {sunburstHoverNode ? (
+                <>
+                  <p>
+                    <strong>Segment:</strong> {String(sunburstHoverNode.name)}
+                  </p>
+                  <p>
+                    <strong>Value:</strong> {(sunburstHoverNode.value ?? 0).toLocaleString()}
+                  </p>
+                  <p>
+                    <strong>Share of current view:</strong>{' '}
+                    {currentSunburstTotal > 0
+                      ? `${(((sunburstHoverNode.value ?? 0) / currentSunburstTotal) * 100).toFixed(2)}%`
+                      : '0.00%'}
+                  </p>
+                  <p>
+                    <strong>Path:</strong>{' '}
+                    {[...currentSunburstPath, String(sunburstHoverNode.name)].join(' / ')}
+                  </p>
+                </>
+              ) : (
+                <p>
+                  Hover any segment to view its value, share, and hierarchy path. Click a segment
+                  to drill down.
+                </p>
+              )}
             </div>
           )}
           <div className="chart-wrap">
@@ -763,6 +879,8 @@ function App() {
                   ringPadding={3}
                   stroke="#ffffff"
                   onClick={handleSunburstClick}
+                  onMouseEnter={(node) => setSunburstHoverNode(node)}
+                  onMouseLeave={() => setSunburstHoverNode(null)}
                 />
               ) : null}
             </ResponsiveContainer>
