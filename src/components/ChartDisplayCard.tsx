@@ -46,6 +46,7 @@ type Props = {
   sunburstHoverPosition: { x: number; y: number }
   onChartMouseMove: (event: MouseEvent<HTMLDivElement>) => void
   onExportPivotCsv: () => void
+  onOpenDetailedWindow: () => void
   onGoSunburstBack: () => void
   onGoSunburstHome: () => void
   onSunburstClick: (node: SunburstData) => void
@@ -69,6 +70,7 @@ function ChartDisplayCard({
   sunburstHoverPosition,
   onChartMouseMove,
   onExportPivotCsv,
+  onOpenDetailedWindow,
   onGoSunburstBack,
   onGoSunburstHome,
   onSunburstClick,
@@ -87,8 +89,18 @@ function ChartDisplayCard({
           <button type="button" className="toolbar-btn" onClick={onExportPivotCsv}>
             Export Pivot CSV
           </button>
+          <button type="button" className="toolbar-btn" onClick={onOpenDetailedWindow}>
+            Open Detailed Window
+          </button>
         </div>
       )}
+      {chartType === 'sunburst' ? (
+        <div className="pivot-actions">
+          <button type="button" className="toolbar-btn" onClick={onOpenDetailedWindow}>
+            Open Detailed Window
+          </button>
+        </div>
+      ) : null}
       {renderPerfNotice ? <p className="notice">{renderPerfNotice}</p> : null}
       {chartType === 'sunburst' && currentSunburstNode && (
         <div className="sunburst-toolbar">

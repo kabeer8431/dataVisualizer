@@ -21,6 +21,10 @@ import LogsCard from './components/LogsCard'
 import QueryPanel from './components/QueryPanel'
 import SunburstFieldsPanel from './components/SunburstFieldsPanel'
 import UploadCard from './components/UploadCard'
+import {
+  DETAILED_CHART_STORAGE_KEY,
+  type DetailedChartPayload,
+} from './detailPayload'
 
 type ChartType = 'bar' | 'line' | 'area' | 'scatter' | 'pie' | 'sunburst'
 type DataRow = Record<string, unknown>
@@ -1802,6 +1806,43 @@ function App() {
     pushLog('info', `Exported ${activeChartModel.chartData.length.toLocaleString()} rows to CSV.`)
   }
 
+  const openDetailedChartWindow = () => {
+    if (!renderChart) {
+      return
+    }
+
+    const payload: DetailedChartPayload = {
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      fileName: fileName || 'data',
+      chartType,
+      dataSourceMode,
+      pivotRowColumn,
+      renderPerfNotice: optimizedRenderChart.notice,
+      colors: COLORS,
+      renderChartModel: optimizedRenderChart.model,
+      sourceChartModel: activeChartModel,
+      currentSunburstNode,
+      currentSunburstPath,
+      currentSunburstTotal,
+    }
+
+    try {
+      localStorage.setItem(DETAILED_CHART_STORAGE_KEY, JSON.stringify(payload))
+    } catch {
+      setError('Unable to prepare detailed chart view due to browser storage limits.')
+      pushLog('error', 'Open detailed window failed: could not store payload.')
+      return
+    }
+
+    const basePath = (import.meta.env.BASE_URL as string | undefined) ?? '/'
+    const normalizedBase = basePath.endsWith('/') ? basePath.slice(0, -1) : basePath
+    const detailPath = `${normalizedBase}/detail-chart`
+    const detailUrl = new URL(detailPath || '/detail-chart', window.location.origin)
+    window.open(detailUrl.toString(), '_blank', 'noopener')
+    pushLog('info', 'Opened detailed chart window.')
+  }
+
   const runSqlQuery = () => {
     if (!sqliteRef.current) {
       setSqlError('SQLite is not ready yet.')
@@ -2349,6 +2390,7 @@ function App() {
         sunburstHoverPosition={sunburstHoverPosition}
         onChartMouseMove={handleChartMouseMove}
         onExportPivotCsv={downloadPivotCsv}
+        onOpenDetailedWindow={openDetailedChartWindow}
         onGoSunburstBack={goSunburstBack}
         onGoSunburstHome={goSunburstHome}
         onSunburstClick={handleSunburstClick}
