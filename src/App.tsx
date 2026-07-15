@@ -2,8 +2,6 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import * as XLSX from 'xlsx'
 import sqlWasmUrl from 'sql.js/dist/sql-wasm.wasm?url'
 import {
-  closestCenter,
-  DndContext,
   KeyboardSensor,
   PointerSensor,
   useSensor,
@@ -12,12 +10,8 @@ import {
 } from '@dnd-kit/core'
 import {
   arrayMove,
-  SortableContext,
   sortableKeyboardCoordinates,
-  useSortable,
-  verticalListSortingStrategy,
 } from '@dnd-kit/sortable'
-import { CSS } from '@dnd-kit/utilities'
 import {
   Area,
   AreaChart,
@@ -41,6 +35,9 @@ import {
 } from 'recharts'
 import initSqlJs from 'sql.js'
 import type { Database, QueryExecResult, SqlJsStatic } from 'sql.js'
+import ColumnsPanel from './components/ColumnsPanel'
+import LogsCard from './components/LogsCard'
+import UploadCard from './components/UploadCard'
 
 type ChartType = 'bar' | 'line' | 'area' | 'scatter' | 'pie' | 'sunburst'
 type DataRow = Record<string, unknown>
@@ -120,6 +117,8 @@ type ChartModel = {
   filteredRowCount: number
 }
 
+type QueryRecord = Record<string, string | number>
+
 type AppLogEntry = {
   id: string
   level: 'info' | 'error'
@@ -167,6 +166,10 @@ const WIZARD_TEMPLATES: WizardTemplate[] = [
 
 function quoteSqlIdentifier(identifier: string): string {
   return `"${identifier.replaceAll('"', '""')}"`
+}
+
+function getNumericQueryColumns(columns: string[], rows: QueryRecord[]): string[] {
+  return columns.filter((column) => rows.some((row) => typeof row[column] === 'number'))
 }
 
 function looksLikeDate(value: unknown): boolean {
@@ -610,29 +613,6 @@ function buildSunburstHierarchy(
   return root
 }
 
-function SortableColumnItem({ column }: { column: string }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
-    useSortable({ id: column })
-
-  const style = {
-    transform: CSS.Transform.toString(transform),
-    transition,
-  }
-
-  return (
-    <li
-      ref={setNodeRef}
-      style={style}
-      className={`sortable-item ${isDragging ? 'dragging' : ''}`}
-    >
-      <button className="drag-handle" type="button" {...attributes} {...listeners}>
-        drag
-      </button>
-      <span>{column}</span>
-    </li>
-  )
-}
-
 function App() {
   const [fileName, setFileName] = useState('')
   const [columns, setColumns] = useState<string[]>([])
@@ -669,7 +649,7 @@ function App() {
   const [querySql, setQuerySql] = useState(
     `SELECT ${quoteSqlIdentifier('Country')} AS category, SUM(${quoteSqlIdentifier('Sales')}) AS value\nFROM ${SQL_TABLE_SOURCE}\nGROUP BY ${quoteSqlIdentifier('Country')}\nORDER BY value DESC\nLIMIT 20`,
   )
-  const [queryRows, setQueryRows] = useState<Record<string, string | number>[]>([])
+  const [queryRows, setQueryRows] = useState<QueryRecord[]>([])
   const [queryColumns, setQueryColumns] = useState<string[]>([])
   const [queryNotice, setQueryNotice] = useState('')
   const [sqliteReady, setSqliteReady] = useState(false)
@@ -1310,9 +1290,24 @@ function App() {
     setSunburstHoverPosition({ x, y })
   }
 
+  const queryNumericColumns = useMemo(
+    () => getNumericQueryColumns(queryColumns, queryRows),
+    [queryColumns, queryRows],
+  )
+
   const sunburstSelectableColumns =
     dataSourceMode === 'query'
-      ? queryColumns.filter((column) => column !== pivotValueColumn)
+      ? (() => {
+          const textLikeColumns = queryColumns.filter(
+            (column) => column !== pivotValueColumn && !queryNumericColumns.includes(column),
+          )
+
+          if (textLikeColumns.length > 0) {
+            return textLikeColumns
+          }
+
+          return queryColumns.filter((column) => column !== pivotValueColumn)
+        })()
       : selectedColumns.filter((column) => column !== pivotValueColumn)
 
   useEffect(() => {
@@ -1590,11 +1585,24 @@ function App() {
 
       setQueryColumns(first.columns)
       setQueryRows(mapped)
+      const numericColumns = getNumericQueryColumns(first.columns, mapped)
+      if (numericColumns.length > 0) {
+        setPivotValueColumn(numericColumns[0])
+      }
+
       const hierarchyDefaults = first.columns
-        .filter((column) => column !== pivotValueColumn)
+        .filter(
+          (column) =>
+            column !== (numericColumns[0] ?? pivotValueColumn) && !numericColumns.includes(column),
+        )
         .slice(0, 2)
       if (hierarchyDefaults.length > 0) {
         setSunburstHierarchyColumns(hierarchyDefaults)
+      } else {
+        const fallbackHierarchy = first.columns
+          .filter((column) => column !== (numericColumns[0] ?? pivotValueColumn))
+          .slice(0, 2)
+        setSunburstHierarchyColumns(fallbackHierarchy)
       }
       setQueryNotice(`Query returned ${mapped.length.toLocaleString()} rows.`)
       setSqlError('')
@@ -1622,68 +1630,24 @@ function App() {
         </p>
       </header>
 
-      <section className="card">
-        <label htmlFor="excel-file" className="upload-label">
-          Upload data file (.xlsx, .xls, .csv, .json)
-        </label>
-        <input
-          id="excel-file"
-          type="file"
-          accept=".xlsx,.xls,.csv,.json"
-          onChange={handleUpload}
-          className="file-input"
-        />
-
-        {fileName && <p className="meta">Loaded file: {fileName}</p>}
-        {sheetData.sheetNames.length > 0 && (
-          <label className="sheet-select-label">
-            Select sheet
-            <select value={sheetData.selectedSheet} onChange={handleSheetChange}>
-              {sheetData.sheetNames.map((sheetName) => (
-                <option key={sheetName} value={sheetName}>
-                  {sheetName}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
-        {notice && <p className="notice">{notice}</p>}
-        {error && <p className="error">{error}</p>}
-      </section>
+      <UploadCard
+        fileName={fileName}
+        sheetData={sheetData}
+        notice={notice}
+        error={error}
+        onUpload={handleUpload}
+        onSheetChange={handleSheetChange}
+      />
 
       {columns.length > 0 && (
         <section className="grid-layout">
-          <article className="card">
-            <h2>All Columns ({columns.length})</h2>
-            <p className="subtle">Click to include/exclude columns from arrangement.</p>
-            <div className="column-list">
-              {columns.map((column) => (
-                <button
-                  key={column}
-                  type="button"
-                  onClick={() => toggleColumn(column)}
-                  className={`pill ${selectedColumns.includes(column) ? 'active' : ''}`}
-                >
-                  {column}
-                </button>
-              ))}
-            </div>
-          </article>
-
-          <article className="card">
-            <h2>Arrange Columns</h2>
-            <p className="subtle">Drag to set your preferred column order.</p>
-
-            <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-              <SortableContext items={selectedColumns} strategy={verticalListSortingStrategy}>
-                <ul className="sortable-list">
-                  {selectedColumns.map((column) => (
-                    <SortableColumnItem key={column} column={column} />
-                  ))}
-                </ul>
-              </SortableContext>
-            </DndContext>
-          </article>
+          <ColumnsPanel
+            columns={columns}
+            selectedColumns={selectedColumns}
+            onToggleColumn={toggleColumn}
+            onDragEnd={handleDragEnd}
+            sensors={sensors}
+          />
 
           <article className="card">
             <h2>Chart Setup</h2>
@@ -2377,38 +2341,12 @@ function App() {
         </section>
       )}
 
-      <section className="card logs-card">
-        <div className="logs-header">
-          <h2>Activity Logs</h2>
-          <div className="logs-actions">
-            <button
-              type="button"
-              className="toolbar-btn"
-              onClick={() => setShowLogs((previous) => !previous)}
-            >
-              {showLogs ? 'Hide Logs' : 'Show Logs'}
-            </button>
-            <button type="button" className="toolbar-btn" onClick={() => setAppLogs([])}>
-              Clear Logs
-            </button>
-          </div>
-        </div>
-        {showLogs ? (
-          appLogs.length > 0 ? (
-            <div className="logs-console" role="log" aria-live="polite">
-              {appLogs.map((entry) => (
-                <p key={entry.id} className={`log-line ${entry.level === 'error' ? 'error' : 'info'}`}>
-                  [{entry.timestamp}] [{entry.level.toUpperCase()}] {entry.message}
-                </p>
-              ))}
-            </div>
-          ) : (
-            <p className="subtle">No log entries yet.</p>
-          )
-        ) : (
-          <p className="subtle">Logs are hidden. Click Show Logs to view app activity.</p>
-        )}
-      </section>
+      <LogsCard
+        showLogs={showLogs}
+        appLogs={appLogs}
+        onToggleLogs={() => setShowLogs((previous) => !previous)}
+        onClearLogs={() => setAppLogs([])}
+      />
     </main>
   )
 }
