@@ -126,12 +126,22 @@ type AppLogEntry = {
   timestamp: string
 }
 
-const MAX_ROWS = 25000
+type SqlitePersistStatus = 'ok' | 'idb' | 'quota' | 'error'
+
 const COLORS = ['#126782', '#f29559', '#457b9d', '#2a9d8f', '#b56576', '#ff7f51']
 const SETTINGS_STORAGE_KEY = 'data-visualizer-settings-v1'
 const SAVED_VIEWS_STORAGE_KEY = 'data-visualizer-saved-views-v1'
 const SQLITE_DB_STORAGE_KEY = 'data-visualizer-sqlite-db-v1'
 const SQL_TABLE_SOURCE = 'uploaded_data'
+const SQLITE_IDB_NAME = 'data-visualizer-sqlite-store'
+const SQLITE_IDB_STORE = 'sqlite_shards'
+const SQLITE_IDB_META_KEY = 'meta'
+const SQLITE_IDB_CHUNK_PREFIX = 'chunk:'
+const SQLITE_IDB_CHUNK_SIZE = 1024 * 1024
+const SQLITE_IDB_PERSISTENCE_NOTICE =
+  'Browser localStorage quota reached. SQLite DB is sharded into IndexedDB and will reload automatically.'
+const SQLITE_PERSISTENCE_WARNING =
+  'Browser storage quota reached. Full data is loaded and usable in this session, but persistent SQLite storage is unavailable.'
 
 const WIZARD_TEMPLATES: WizardTemplate[] = [
   {
@@ -263,7 +273,7 @@ function parseMatrixData(matrix: unknown[][]): ParsedDataResult {
   }
 
   const headers = uniqueHeaders(matrix[0], width)
-  const dataRows = matrix.slice(1, MAX_ROWS + 1).map((cells) => {
+  const dataRows = matrix.slice(1).map((cells) => {
     const row: DataRow = {}
     headers.forEach((header, index) => {
       row[header] = cells[index] ?? null
@@ -271,16 +281,10 @@ function parseMatrixData(matrix: unknown[][]): ParsedDataResult {
     return row
   })
 
-  const result: ParsedDataResult = {
+  return {
     headers,
     dataRows,
   }
-
-  if (matrix.length - 1 > MAX_ROWS) {
-    result.notice = `Loaded first ${MAX_ROWS.toLocaleString()} rows for smooth chart rendering out of ${(matrix.length - 1).toLocaleString()} rows.`
-  }
-
-  return result
 }
 
 function normalizeJsonRecords(parsed: unknown): DataRow[] {
@@ -324,11 +328,10 @@ function parseJsonData(text: string): ParsedDataResult {
     throw new Error('The JSON file has no rows.')
   }
 
-  const limitedRows = allRows.slice(0, MAX_ROWS)
   const headerSeen = new Set<string>()
   const headers: string[] = []
 
-  limitedRows.forEach((row) => {
+  allRows.forEach((row) => {
     Object.keys(row).forEach((key) => {
       if (!headerSeen.has(key)) {
         headerSeen.add(key)
@@ -341,7 +344,7 @@ function parseJsonData(text: string): ParsedDataResult {
     throw new Error('Could not detect any fields in the JSON rows.')
   }
 
-  const dataRows = limitedRows.map((row) => {
+  const dataRows = allRows.map((row) => {
     const normalized: DataRow = {}
     headers.forEach((header) => {
       normalized[header] = row[header] ?? null
@@ -349,16 +352,10 @@ function parseJsonData(text: string): ParsedDataResult {
     return normalized
   })
 
-  const result: ParsedDataResult = {
+  return {
     headers,
     dataRows,
   }
-
-  if (allRows.length > MAX_ROWS) {
-    result.notice = `Loaded first ${MAX_ROWS.toLocaleString()} rows for smooth chart rendering out of ${allRows.length.toLocaleString()} rows.`
-  }
-
-  return result
 }
 
 function parseWorkbookSheet(workbook: XLSX.WorkBook, sheetName: string): ParsedDataResult {
@@ -452,9 +449,149 @@ function csvEscape(value: string | number): string {
   return text
 }
 
-function saveSqliteToLocalStorage(db: Database): void {
-  const exported = db.export()
-  localStorage.setItem(SQLITE_DB_STORAGE_KEY, JSON.stringify(Array.from(exported)))
+function isQuotaExceededError(error: unknown): boolean {
+  return (
+    error instanceof DOMException &&
+    (error.name === 'QuotaExceededError' || error.name === 'NS_ERROR_DOM_QUOTA_REACHED')
+  )
+}
+
+function openSqliteShardDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(SQLITE_IDB_NAME, 1)
+
+    request.onupgradeneeded = () => {
+      const db = request.result
+      if (!db.objectStoreNames.contains(SQLITE_IDB_STORE)) {
+        db.createObjectStore(SQLITE_IDB_STORE, { keyPath: 'id' })
+      }
+    }
+
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error ?? new Error('Failed to open IndexedDB.'))
+  })
+}
+
+function idbRequestToPromise<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error ?? new Error('IndexedDB request failed.'))
+  })
+}
+
+function idbTransactionToPromise(transaction: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve()
+    transaction.onerror = () => reject(transaction.error ?? new Error('IndexedDB transaction failed.'))
+    transaction.onabort = () => reject(transaction.error ?? new Error('IndexedDB transaction aborted.'))
+  })
+}
+
+async function saveSqliteToIndexedDbShards(bytes: Uint8Array): Promise<void> {
+  const db = await openSqliteShardDb()
+  try {
+    const transaction = db.transaction(SQLITE_IDB_STORE, 'readwrite')
+    const store = transaction.objectStore(SQLITE_IDB_STORE)
+
+    store.clear()
+
+    const chunkCount = Math.ceil(bytes.length / SQLITE_IDB_CHUNK_SIZE)
+    for (let index = 0; index < chunkCount; index += 1) {
+      const start = index * SQLITE_IDB_CHUNK_SIZE
+      const end = Math.min(start + SQLITE_IDB_CHUNK_SIZE, bytes.length)
+      const chunk = bytes.slice(start, end)
+      store.put({
+        id: `${SQLITE_IDB_CHUNK_PREFIX}${index}`,
+        kind: 'chunk',
+        index,
+        data: chunk.buffer,
+      })
+    }
+
+    store.put({
+      id: SQLITE_IDB_META_KEY,
+      kind: 'meta',
+      chunkCount,
+      totalBytes: bytes.length,
+      savedAt: new Date().toISOString(),
+    })
+
+    await idbTransactionToPromise(transaction)
+  } finally {
+    db.close()
+  }
+}
+
+async function readSqliteFromIndexedDbShards(): Promise<Uint8Array | null> {
+  if (typeof indexedDB === 'undefined') {
+    return null
+  }
+
+  const db = await openSqliteShardDb()
+  try {
+    const transaction = db.transaction(SQLITE_IDB_STORE, 'readonly')
+    const store = transaction.objectStore(SQLITE_IDB_STORE)
+    const records = (await idbRequestToPromise(store.getAll())) as Array<Record<string, unknown>>
+
+    const meta = records.find((record) => record.id === SQLITE_IDB_META_KEY)
+    const chunkCount = Number(meta?.chunkCount ?? 0)
+    if (!Number.isFinite(chunkCount) || chunkCount <= 0) {
+      return null
+    }
+
+    const totalBytesCandidate = Number(meta?.totalBytes ?? 0)
+    const totalBytes =
+      Number.isFinite(totalBytesCandidate) && totalBytesCandidate > 0
+        ? totalBytesCandidate
+        : undefined
+
+    const chunks = records
+      .filter((record) => String(record.id ?? '').startsWith(SQLITE_IDB_CHUNK_PREFIX))
+      .sort((left, right) => Number(left.index ?? 0) - Number(right.index ?? 0))
+
+    if (chunks.length !== chunkCount) {
+      return null
+    }
+
+    const arrays = chunks.map((record) => new Uint8Array(record.data as ArrayBuffer))
+    const mergedLength = totalBytes ?? arrays.reduce((sum, chunk) => sum + chunk.length, 0)
+    const merged = new Uint8Array(mergedLength)
+
+    let offset = 0
+    arrays.forEach((chunk) => {
+      merged.set(chunk, offset)
+      offset += chunk.length
+    })
+
+    return merged
+  } finally {
+    db.close()
+  }
+}
+
+async function saveSqliteToBrowserStorage(db: Database): Promise<SqlitePersistStatus> {
+  try {
+    const exported = db.export()
+    localStorage.setItem(SQLITE_DB_STORAGE_KEY, JSON.stringify(Array.from(exported)))
+    return 'ok'
+  } catch (error) {
+    if (isQuotaExceededError(error)) {
+      try {
+        const exported = db.export()
+        await saveSqliteToIndexedDbShards(exported)
+        try {
+          localStorage.removeItem(SQLITE_DB_STORAGE_KEY)
+        } catch {
+          // Ignore localStorage cleanup failures.
+        }
+        return 'idb'
+      } catch {
+        return 'quota'
+      }
+    }
+
+    return 'error'
+  }
 }
 
 function readSavedViewsFromDb(db: Database): SavedView[] {
@@ -647,7 +784,7 @@ function App() {
   const [wizardDimension, setWizardDimension] = useState('')
   const [wizardSeries, setWizardSeries] = useState('')
   const [querySql, setQuerySql] = useState(
-    `SELECT ${quoteSqlIdentifier('Country')} AS category, SUM(${quoteSqlIdentifier('Sales')}) AS value\nFROM ${SQL_TABLE_SOURCE}\nGROUP BY ${quoteSqlIdentifier('Country')}\nORDER BY value DESC\nLIMIT 20`,
+    `SELECT ${quoteSqlIdentifier('Country')} AS category, SUM(${quoteSqlIdentifier('Sales')}) AS value\nFROM ${SQL_TABLE_SOURCE}\nGROUP BY ${quoteSqlIdentifier('Country')}\nORDER BY value DESC`,
   )
   const [queryRows, setQueryRows] = useState<QueryRecord[]>([])
   const [queryColumns, setQueryColumns] = useState<string[]>([])
@@ -656,6 +793,7 @@ function App() {
   const [sqlError, setSqlError] = useState('')
   const [showLogs, setShowLogs] = useState(false)
   const [appLogs, setAppLogs] = useState<AppLogEntry[]>([])
+  const [sqlitePersistStatus, setSqlitePersistStatus] = useState<SqlitePersistStatus>('ok')
   const importConfigInputRef = useRef<HTMLInputElement | null>(null)
   const sqliteRef = useRef<Database | null>(null)
 
@@ -724,10 +862,33 @@ function App() {
     const setupSqlite = async () => {
       try {
         const SQL: SqlJsStatic = await initSqlJs({ locateFile: () => sqlWasmUrl })
+        let db: Database | null = null
+        let restoredFromIdb = false
+
         const serializedDb = localStorage.getItem(SQLITE_DB_STORAGE_KEY)
-        const db = serializedDb
-          ? new SQL.Database(Uint8Array.from(JSON.parse(serializedDb) as number[]))
-          : new SQL.Database()
+        if (serializedDb) {
+          try {
+            db = new SQL.Database(Uint8Array.from(JSON.parse(serializedDb) as number[]))
+          } catch {
+            try {
+              localStorage.removeItem(SQLITE_DB_STORAGE_KEY)
+            } catch {
+              // Ignore malformed localStorage cleanup failures.
+            }
+          }
+        }
+
+        if (!db) {
+          const idbBytes = await readSqliteFromIndexedDbShards()
+          if (idbBytes) {
+            db = new SQL.Database(idbBytes)
+            restoredFromIdb = true
+          }
+        }
+
+        if (!db) {
+          db = new SQL.Database()
+        }
 
         db.run(
           `CREATE TABLE IF NOT EXISTS saved_views (
@@ -746,6 +907,11 @@ function App() {
         sqliteRef.current = db
         setSavedViews(readSavedViewsFromDb(db))
         setSqliteReady(true)
+        setSqlitePersistStatus(restoredFromIdb ? 'idb' : 'ok')
+        if (restoredFromIdb) {
+          setNotice(SQLITE_IDB_PERSISTENCE_NOTICE)
+          pushLog('info', 'SQLite restored from IndexedDB shards.')
+        }
         pushLog('info', 'SQLite initialized and ready.')
       } catch {
         if (!canceled) {
@@ -768,8 +934,42 @@ function App() {
   }, [])
 
   useEffect(() => {
-    localStorage.setItem(SAVED_VIEWS_STORAGE_KEY, JSON.stringify(savedViews))
+    try {
+      localStorage.setItem(SAVED_VIEWS_STORAGE_KEY, JSON.stringify(savedViews))
+    } catch {
+      // Ignore localStorage write errors.
+    }
   }, [savedViews])
+
+  const persistSqliteSnapshot = async (
+    context: string,
+  ): Promise<SqlitePersistStatus | 'none'> => {
+    if (!sqliteRef.current) {
+      return 'none'
+    }
+
+    const status = await saveSqliteToBrowserStorage(sqliteRef.current)
+    if (status === 'ok') {
+      if (sqlitePersistStatus !== 'ok') {
+        setSqlitePersistStatus('ok')
+      }
+      return 'ok'
+    }
+
+    if (status !== sqlitePersistStatus) {
+      setSqlitePersistStatus(status)
+      const message =
+        status === 'idb'
+          ? SQLITE_IDB_PERSISTENCE_NOTICE
+          : status === 'quota'
+            ? SQLITE_PERSISTENCE_WARNING
+            : 'Unable to persist SQLite DB to browser storage. Data is still available in this session.'
+      setNotice(message)
+      pushLog(status === 'idb' ? 'info' : 'error', `${context}: SQLite persistence status (${status}).`)
+    }
+
+    return status
+  }
 
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -847,8 +1047,13 @@ function App() {
 
       if (sqliteRef.current) {
         rebuildSourceTable(sqliteRef.current, parsedData.dataRows, parsedData.headers)
-        saveSqliteToLocalStorage(sqliteRef.current)
-        pushLog('info', `SQLite source table refreshed from ${file.name}.`)
+        const persistStatus = await persistSqliteSnapshot(`Upload ${file.name}`)
+        pushLog(
+          'info',
+          persistStatus === 'ok' || persistStatus === 'idb'
+            ? `SQLite source table refreshed from ${file.name}.`
+            : `SQLite source table refreshed from ${file.name} (session-only persistence).`,
+        )
       }
     } catch (parseError) {
       if (parseError instanceof Error) {
@@ -861,7 +1066,7 @@ function App() {
     }
   }
 
-  const handleSheetChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+  const handleSheetChange = async (event: React.ChangeEvent<HTMLSelectElement>) => {
     const nextSheet = event.target.value
 
     if (!sheetData.workbook) {
@@ -896,8 +1101,13 @@ function App() {
 
       if (sqliteRef.current) {
         rebuildSourceTable(sqliteRef.current, parsedData.dataRows, parsedData.headers)
-        saveSqliteToLocalStorage(sqliteRef.current)
-        pushLog('info', `SQLite source table refreshed from sheet ${nextSheet}.`)
+        const persistStatus = await persistSqliteSnapshot(`Switch sheet ${nextSheet}`)
+        pushLog(
+          'info',
+          persistStatus === 'ok' || persistStatus === 'idb'
+            ? `SQLite source table refreshed from sheet ${nextSheet}.`
+            : `SQLite source table refreshed from sheet ${nextSheet} (session-only persistence).`,
+        )
       }
     } catch (parseError) {
       if (parseError instanceof Error) {
@@ -1394,7 +1604,7 @@ function App() {
     setError('')
   }
 
-  const saveCurrentView = () => {
+  const saveCurrentView = async () => {
     const name = viewNameInput.trim()
     if (!name) {
       setError('Please enter a name before saving a view.')
@@ -1413,8 +1623,8 @@ function App() {
         'INSERT OR REPLACE INTO saved_views (id, name, config_json, created_at) VALUES (?, ?, ?, ?)',
         [nextView.id, nextView.name, JSON.stringify(nextView.config), new Date().toISOString()],
       )
-      saveSqliteToLocalStorage(sqliteRef.current)
       setSavedViews(readSavedViewsFromDb(sqliteRef.current))
+      await persistSqliteSnapshot(`Save view ${name}`)
       setViewNameInput('')
       setError('')
       pushLog('info', `Saved view "${name}" to SQLite.`)
@@ -1436,11 +1646,11 @@ function App() {
     pushLog('info', `Loaded saved view "${target.name}".`)
   }
 
-  const deleteSavedView = (viewId: string) => {
+  const deleteSavedView = async (viewId: string) => {
     if (sqliteRef.current) {
       sqliteRef.current.run('DELETE FROM saved_views WHERE id = ?', [viewId])
-      saveSqliteToLocalStorage(sqliteRef.current)
       setSavedViews(readSavedViewsFromDb(sqliteRef.current))
+      await persistSqliteSnapshot(`Delete view ${viewId}`)
       pushLog('info', 'Deleted saved view from SQLite.')
       return
     }
@@ -1807,7 +2017,7 @@ function App() {
                       className="secondary-btn"
                       onClick={() => {
                         setQuerySql(
-                          `SELECT ${quoteSqlIdentifier('Country')} AS category, SUM(${quoteSqlIdentifier('Sales')}) AS value\nFROM ${SQL_TABLE_SOURCE}\nGROUP BY ${quoteSqlIdentifier('Country')}\nORDER BY value DESC\nLIMIT 20`,
+                          `SELECT ${quoteSqlIdentifier('Country')} AS category, SUM(${quoteSqlIdentifier('Sales')}) AS value\nFROM ${SQL_TABLE_SOURCE}\nGROUP BY ${quoteSqlIdentifier('Country')}\nORDER BY value DESC`,
                         )
                       }}
                     >
