@@ -623,7 +623,7 @@ function App() {
   const [pivotValueColumn, setPivotValueColumn] = useState('')
   const [pivotAggregation, setPivotAggregation] = useState<PivotAggregation>('sum')
   const [pivotSortOrder, setPivotSortOrder] = useState<PivotSortOrder>('desc')
-  const [pivotTopN, setPivotTopN] = useState(20)
+  const [pivotTopN, setPivotTopN] = useState(0)
   const [filterColumn, setFilterColumn] = useState('')
   const [filterQuery, setFilterQuery] = useState('')
   const [sunburstHierarchyColumns, setSunburstHierarchyColumns] = useState<string[]>([])
@@ -830,7 +830,7 @@ function App() {
       setPivotValueColumn(pickDefaultValueColumn(parsedData.headers, parsedData.dataRows))
       setPivotAggregation('count')
       setPivotSortOrder('desc')
-      setPivotTopN(20)
+      setPivotTopN(0)
       setFilterColumn(parsedData.headers[0] ?? '')
       setFilterQuery('')
       setSunburstHierarchyColumns(parsedData.headers.slice(0, 2))
@@ -879,7 +879,7 @@ function App() {
       setPivotValueColumn(pickDefaultValueColumn(parsedData.headers, parsedData.dataRows))
       setPivotAggregation('count')
       setPivotSortOrder('desc')
-      setPivotTopN(20)
+      setPivotTopN(0)
       setFilterColumn(parsedData.headers[0] ?? '')
       setFilterQuery('')
       setSunburstHierarchyColumns(parsedData.headers.slice(0, 2))
@@ -1062,9 +1062,11 @@ function App() {
     }
 
     const hierarchyBase = dataSourceMode === 'query' ? queryColumns : selectedColumns
-    const hierarchyColumns = sunburstHierarchyColumns
-      .filter((column) => hierarchyBase.includes(column) && column !== pivotValueColumn)
-      .slice(0, 4)
+    const chosenHierarchy = sunburstHierarchyColumns.filter(
+      (column) => hierarchyBase.includes(column) && column !== pivotValueColumn,
+    )
+    const fallbackHierarchy = hierarchyBase.filter((column) => column !== pivotValueColumn)
+    const hierarchyColumns = chosenHierarchy.length > 0 ? chosenHierarchy : fallbackHierarchy
     const numericMeasure = sourceRows.some((row) => toNumber(row[pivotValueColumn]) !== null)
       ? pivotValueColumn
       : undefined
@@ -1196,13 +1198,6 @@ function App() {
   }, [columnInsights])
 
   const submitConfiguration = () => {
-    if (
-      chartType === 'sunburst' &&
-      sunburstHierarchyColumns.filter((column) => column !== pivotValueColumn).length === 0
-    ) {
-      setError('Please choose at least one hierarchy field for Sunburst.')
-      return
-    }
 
     if (chartType !== 'sunburst' && !pivotRowColumn) {
       setError('Please choose a Rows field for pivot output.')
@@ -1316,7 +1311,7 @@ function App() {
     )
 
     if (sanitized.length !== sunburstHierarchyColumns.length) {
-      setSunburstHierarchyColumns(sanitized.slice(0, 4))
+      setSunburstHierarchyColumns(sanitized)
       return
     }
 
@@ -1331,13 +1326,8 @@ function App() {
         return previous.filter((item) => item !== column)
       }
 
-      if (previous.length >= 4) {
-        return previous
-      }
-
       return [...previous, column]
     })
-    setRenderChart(false)
   }
 
   const resetPivotControls = () => {
@@ -1352,7 +1342,7 @@ function App() {
     setPivotValueColumn(defaults.value)
     setPivotAggregation('count')
     setPivotSortOrder('desc')
-    setPivotTopN(20)
+    setPivotTopN(0)
     setFilterColumn(defaults.filter)
     setFilterQuery('')
     setSunburstHierarchyColumns(selectedColumns.slice(0, 2))
@@ -1841,7 +1831,6 @@ function App() {
                       value={pivotValueColumn}
                       onChange={(event) => {
                         setPivotValueColumn(event.target.value)
-                        setRenderChart(false)
                       }}
                     >
                       {(dataSourceMode === 'query' ? queryColumns : selectedColumns).map((column) => (
@@ -1853,7 +1842,7 @@ function App() {
                   </div>
 
                   <fieldset className="sunburst-levels">
-                    <legend>Hierarchy Fields (max 4)</legend>
+                    <legend>Hierarchy Fields</legend>
                     <div className="sunburst-level-grid">
                       {sunburstSelectableColumns.map((column) => (
                         <label key={`sunburst-level-${column}`} className="checkbox-item">
