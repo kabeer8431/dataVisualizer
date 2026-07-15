@@ -85,6 +85,7 @@ type ViewConfig = {
   wizardMetric: string
   wizardDimension: string
   wizardSeries: string
+  sunburstHierarchyColumns: string[]
   selectedColumns: string[]
 }
 
@@ -645,6 +646,7 @@ function App() {
   const [pivotTopN, setPivotTopN] = useState(20)
   const [filterColumn, setFilterColumn] = useState('')
   const [filterQuery, setFilterQuery] = useState('')
+  const [sunburstHierarchyColumns, setSunburstHierarchyColumns] = useState<string[]>([])
   const [chartType, setChartType] = useState<ChartType>('bar')
   const [renderChart, setRenderChart] = useState(false)
   const [error, setError] = useState('')
@@ -851,6 +853,7 @@ function App() {
       setPivotTopN(20)
       setFilterColumn(parsedData.headers[0] ?? '')
       setFilterQuery('')
+      setSunburstHierarchyColumns(parsedData.headers.slice(0, 2))
       const insights = getColumnInsights(parsedData.headers, parsedData.dataRows)
       setWizardMetric(insights.numeric[0] ?? parsedData.headers[0] ?? '')
       setWizardDimension(insights.categorical[0] ?? parsedData.headers[0] ?? '')
@@ -899,6 +902,7 @@ function App() {
       setPivotTopN(20)
       setFilterColumn(parsedData.headers[0] ?? '')
       setFilterQuery('')
+      setSunburstHierarchyColumns(parsedData.headers.slice(0, 2))
       const insights = getColumnInsights(parsedData.headers, parsedData.dataRows)
       setWizardMetric(insights.numeric[0] ?? parsedData.headers[0] ?? '')
       setWizardDimension(insights.categorical[0] ?? parsedData.headers[0] ?? '')
@@ -1078,7 +1082,9 @@ function App() {
     }
 
     const hierarchyBase = dataSourceMode === 'query' ? queryColumns : selectedColumns
-    const hierarchyColumns = hierarchyBase.slice(0, 4)
+    const hierarchyColumns = sunburstHierarchyColumns
+      .filter((column) => hierarchyBase.includes(column) && column !== pivotValueColumn)
+      .slice(0, 4)
     const numericMeasure = sourceRows.some((row) => toNumber(row[pivotValueColumn]) !== null)
       ? pivotValueColumn
       : undefined
@@ -1093,6 +1099,7 @@ function App() {
     renderChart,
     rows,
     selectedColumns,
+    sunburstHierarchyColumns,
   ])
 
   const activeChartModel: ChartModel =
@@ -1209,8 +1216,11 @@ function App() {
   }, [columnInsights])
 
   const submitConfiguration = () => {
-    if (chartType === 'sunburst' && selectedColumns.length === 0) {
-      setError('Please keep at least one column selected for Sunburst hierarchy.')
+    if (
+      chartType === 'sunburst' &&
+      sunburstHierarchyColumns.filter((column) => column !== pivotValueColumn).length === 0
+    ) {
+      setError('Please choose at least one hierarchy field for Sunburst.')
       return
     }
 
@@ -1281,6 +1291,7 @@ function App() {
         .filter((item) => item && selectedColumns.includes(item))
         .concat(selectedColumns.filter((item) => item !== wizardDimension && item !== wizardSeries))
       setSelectedColumns(hierarchy)
+      setSunburstHierarchyColumns([wizardDimension, wizardSeries].filter((item) => Boolean(item)))
     }
 
     setError('')
@@ -1299,6 +1310,41 @@ function App() {
     setSunburstHoverPosition({ x, y })
   }
 
+  const sunburstSelectableColumns =
+    dataSourceMode === 'query'
+      ? queryColumns.filter((column) => column !== pivotValueColumn)
+      : selectedColumns.filter((column) => column !== pivotValueColumn)
+
+  useEffect(() => {
+    const sanitized = sunburstHierarchyColumns.filter((column) =>
+      sunburstSelectableColumns.includes(column),
+    )
+
+    if (sanitized.length !== sunburstHierarchyColumns.length) {
+      setSunburstHierarchyColumns(sanitized.slice(0, 4))
+      return
+    }
+
+    if (sanitized.length === 0 && sunburstSelectableColumns.length > 0) {
+      setSunburstHierarchyColumns(sunburstSelectableColumns.slice(0, 2))
+    }
+  }, [sunburstHierarchyColumns, sunburstSelectableColumns])
+
+  const toggleSunburstHierarchyColumn = (column: string) => {
+    setSunburstHierarchyColumns((previous) => {
+      if (previous.includes(column)) {
+        return previous.filter((item) => item !== column)
+      }
+
+      if (previous.length >= 4) {
+        return previous
+      }
+
+      return [...previous, column]
+    })
+    setRenderChart(false)
+  }
+
   const resetPivotControls = () => {
     const defaults = {
       row: selectedColumns[0] ?? '',
@@ -1314,6 +1360,7 @@ function App() {
     setPivotTopN(20)
     setFilterColumn(defaults.filter)
     setFilterQuery('')
+    setSunburstHierarchyColumns(selectedColumns.slice(0, 2))
     setRenderChart(false)
     pushLog('info', 'Pivot controls reset to defaults.')
   }
@@ -1334,6 +1381,7 @@ function App() {
     wizardMetric,
     wizardDimension,
     wizardSeries,
+    sunburstHierarchyColumns,
     selectedColumns,
   })
 
@@ -1353,6 +1401,7 @@ function App() {
     setWizardMetric(config.wizardMetric ?? wizardMetric)
     setWizardDimension(config.wizardDimension ?? wizardDimension)
     setWizardSeries(config.wizardSeries ?? wizardSeries)
+    setSunburstHierarchyColumns(config.sunburstHierarchyColumns ?? sunburstHierarchyColumns)
     if (Array.isArray(config.selectedColumns) && config.selectedColumns.length > 0) {
       setSelectedColumns(config.selectedColumns)
     }
@@ -1541,6 +1590,12 @@ function App() {
 
       setQueryColumns(first.columns)
       setQueryRows(mapped)
+      const hierarchyDefaults = first.columns
+        .filter((column) => column !== pivotValueColumn)
+        .slice(0, 2)
+      if (hierarchyDefaults.length > 0) {
+        setSunburstHierarchyColumns(hierarchyDefaults)
+      }
       setQueryNotice(`Query returned ${mapped.length.toLocaleString()} rows.`)
       setSqlError('')
       setDataSourceMode('query')
@@ -1813,8 +1868,8 @@ function App() {
                 </div>
               ) : null}
 
-              {dataSourceMode === 'pivot' && isSunburstChart ? (
-                <>
+              {isSunburstChart ? (
+                <div className="sunburst-field-panel">
                   <div className="compact-field">
                     <label htmlFor="sunburst-value-field">Value Field</label>
                     <select
@@ -1825,18 +1880,30 @@ function App() {
                         setRenderChart(false)
                       }}
                     >
-                      {selectedColumns.map((column) => (
-                        <option key={column} value={column}>
+                      {(dataSourceMode === 'query' ? queryColumns : selectedColumns).map((column) => (
+                        <option key={`sunburst-value-${column}`} value={column}>
                           {column}
                         </option>
                       ))}
                     </select>
                   </div>
-                  <p className="subtle">
-                    Hierarchy comes from your arranged columns (first 4), and Value Field is used
-                    as the measure when numeric.
-                  </p>
-                </>
+
+                  <fieldset className="sunburst-levels">
+                    <legend>Hierarchy Fields (max 4)</legend>
+                    <div className="sunburst-level-grid">
+                      {sunburstSelectableColumns.map((column) => (
+                        <label key={`sunburst-level-${column}`} className="checkbox-item">
+                          <input
+                            type="checkbox"
+                            checked={sunburstHierarchyColumns.includes(column)}
+                            onChange={() => toggleSunburstHierarchyColumn(column)}
+                          />
+                          {column}
+                        </label>
+                      ))}
+                    </div>
+                  </fieldset>
+                </div>
               ) : null}
 
               {dataSourceMode === 'pivot' && !isSunburstChart ? (
